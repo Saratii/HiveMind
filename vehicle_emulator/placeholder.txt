@@ -2,4 +2,8 @@ fixed physics time step (16ms)
 Each car will be a server and client
 Description of the vehicle
 Speed
-
+Open web socket and send exact position/stats to unity
+Start off grid
+Cars will have predetermnied destination
+Instruction handling (speed/direction)
+Cars responsiblity to stay on the road

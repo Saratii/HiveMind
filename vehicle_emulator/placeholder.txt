@@ -1,0 +1,3 @@
+Each car will be a server and client
+Description of the vehicle
+Speed

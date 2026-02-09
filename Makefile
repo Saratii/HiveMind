@@ -6,7 +6,7 @@ CITY_MAP_TARGET = $(BIN_DIR)/city_map.exe
 CITY_MAP_SRC = hive_mind_server/city_map.c hive_mind_server/city_constants.c
 
 SERVER_TARGET = $(BIN_DIR)/server.exe
-SERVER_SRC = hive_mind_server/server.c
+SERVER_SRC = hive_mind_server/server.c hive_mind_server/car.c
 
 CFLAGS = -O2 -std=c11 -I$(VCPKG_ROOT)/installed/x64-windows/include
 LDFLAGS = -L$(VCPKG_ROOT)/installed/x64-windows/lib \

@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include "car.h"
 
 #include <uv.h>
 
@@ -39,6 +40,11 @@ static void allocate_buffer(
     buffer->len = suggested_size;
 }
 
+static int starts_with(const char *str, const char *prefix)
+{
+    return strncmp(str, prefix, strlen(prefix)) == 0;
+}
+
 static void on_client_read(
     uv_stream_t *stream,
     ssize_t bytes_read,
@@ -46,12 +52,46 @@ static void on_client_read(
 {
     if (bytes_read > 0)
     {
-        const char *response_text =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: 12\r\n"
-            "\r\n"
-            "hello world";
+        const char *response_text = NULL;
+        char response_buffer_text[256];
+
+        if (starts_with(buffer->base, "POST /register-car"))
+        {
+            char license[20] = {0};
+            Point start = {0, 0};
+            Point dest = {0, 0};
+
+            char *body = strstr(buffer->base, "\r\n\r\n");
+            if (body != NULL)
+            {
+                body += 4;
+                sscanf(body, "license=%19[^&]&start_x=%lf&start_y=%lf&dest_x=%lf&dest_y=%lf",
+                       license, &start.x, &start.y, &dest.x, &dest.y);
+
+                add_car(license, start, dest);
+                printf("Car registered: %s (%.2f, %.2f) -> (%.2f, %.2f)\n", license, start.x, start.y, dest.x, dest.y);
+                snprintf(response_buffer_text, sizeof(response_buffer_text),
+                         "HTTP/1.1 200 OK\r\n"
+                         "Content-Type: text/plain\r\n"
+                         "Content-Length: 18\r\n"
+                         "\r\n"
+                         "Car registered: %s",
+                         license);
+                response_text = response_buffer_text;
+            }
+        }
+        else
+        {
+            int car_count = get_car_count();
+            snprintf(response_buffer_text, sizeof(response_buffer_text),
+                     "HTTP/1.1 200 OK\r\n"
+                     "Content-Type: text/plain\r\n"
+                     "Content-Length: 30\r\n"
+                     "\r\n"
+                     "Total cars registered: %d",
+                     car_count);
+            response_text = response_buffer_text;
+        }
 
         size_t response_length = strlen(response_text);
 
@@ -143,8 +183,12 @@ int main(void)
         fprintf(stderr, "listen failed\n");
         return EXIT_FAILURE;
     }
-
+    if (listen_result != 0)
+    {
+        fprintf(stderr, "listen failed\n");
+        return EXIT_FAILURE;
+    }
+    printf("Server running on http://0.0.0.0:8080\n");
     uv_run(event_loop, UV_RUN_DEFAULT);
-
     return EXIT_SUCCESS;
 }

@@ -12,7 +12,6 @@ Each [x, y] value represents a position in world space measured in meters.
 City is centered at 0, 0
 
 The origin (0,0) is arbitrary but must be shared between the simulation server and renderer.
-origin + 10 = 10 meters
 1 unit = 1 meter
 
 City Map JSON Format

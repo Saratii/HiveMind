@@ -7,3 +7,6 @@ Start off grid
 Cars will have predetermnied destination
 Instruction handling (speed/direction)
 Cars responsiblity to stay on the road
+Each car will be a server and client
+Description of the vehicle
+Speed

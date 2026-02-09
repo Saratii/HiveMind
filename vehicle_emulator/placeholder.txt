@@ -1,3 +1,5 @@
+fixed physics time step (16ms)
 Each car will be a server and client
 Description of the vehicle
 Speed
+

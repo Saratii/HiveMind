@@ -1,18 +1,23 @@
+# Server Testing
+bin\server.exe
+curl http://localhost:8080
+powershell: Invoke-WebRequest -Method POST -Uri "http://localhost:8080/register-car" -Body "license=ABC123&start_x=0&start_y=0&dest_x=10&dest_y=20"
+
+# Installation
 vcpkg install libuv:x64-windows
 vcpkg install raylib:x64-windows
+
+# Map Generation
 
 bin\city_map.exe generate 12345
 bin\city_map.exe export 12345 hive_mind_server/city.json
 bin\city_map.exe load hive_mind_server/city.json
-bin\server.exe
-curl http://localhost:8080
 
 All coordinates are expressed in meters.
 Each [x, y] value represents a position in world space measured in meters.
 City is centered at 0, 0
 
 The origin (0,0) is arbitrary but must be shared between the simulation server and renderer.
-origin + 10 = 10 meters
 1 unit = 1 meter
 
 City Map JSON Format

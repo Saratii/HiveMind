@@ -8,6 +8,9 @@ CITY_MAP_SRC = hive_mind_server/city_map.c hive_mind_server/city_constants.c
 SERVER_TARGET = $(BIN_DIR)/server.exe
 SERVER_SRC = hive_mind_server/server.c hive_mind_server/car.c
 
+CAR_NODE_TARGET = $(BIN_DIR)/car_node.exe
+CAR_NODE_SRC = vehicle_emulator/car_node.c vehicle_emulator/cars.c
+
 CFLAGS = -O2 -std=c11 -I$(VCPKG_ROOT)/installed/x64-windows/include
 LDFLAGS = -L$(VCPKG_ROOT)/installed/x64-windows/lib \
           -luv \
@@ -15,7 +18,7 @@ LDFLAGS = -L$(VCPKG_ROOT)/installed/x64-windows/lib \
 
 DLL_DIR = $(VCPKG_ROOT)/installed/x64-windows/bin
 
-all: $(CITY_MAP_TARGET) $(SERVER_TARGET)
+all: $(CITY_MAP_TARGET) $(SERVER_TARGET) $(CAR_NODE_TARGET)
 
 $(CITY_MAP_TARGET): $(CITY_MAP_SRC)
 	if not exist $(BIN_DIR) mkdir $(BIN_DIR)
@@ -27,5 +30,9 @@ $(SERVER_TARGET): $(SERVER_SRC)
 	gcc $(CFLAGS) $(SERVER_SRC) -o $(SERVER_TARGET) $(LDFLAGS)
 	copy "$(DLL_DIR)\*.dll" "$(BIN_DIR)\"
 
+$(CAR_NODE_TARGET): $(CAR_NODE_SRC)
+	if not exist $(BIN_DIR) mkdir $(BIN_DIR)
+	gcc $(CFLAGS) $(CAR_NODE_SRC) -o $(CAR_NODE_TARGET) $(UV_LDFLAGS)
+	copy "$(DLL_DIR)\*.dll" "$(BIN_DIR)\"
 clean:
-	del /Q "$(BIN_DIR)\city_map.exe" "$(BIN_DIR)\server.exe" "$(BIN_DIR)\*.dll" 2>NUL
+	del /Q "$(BIN_DIR)\city_map.exe" "$(BIN_DIR)\server.exe" "$(BIN_DIR)\car_node.exe" "$(BIN_DIR)\*.dll" 2>NUL

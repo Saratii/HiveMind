@@ -11,6 +11,7 @@ pub struct Point {
     pub y: f64,
 }
 
+#[derive(Clone)]
 struct Car {
     license: String,
     url: String,
@@ -70,7 +71,34 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
         "Car registered: {} url={} ({:.2}, {:.2}) -> ({:.2}, {:.2})",
         car.license, car.url, car.start.x, car.start.y, car.dest.x, car.dest.y
     );
-    state.cars.lock().unwrap().push(car);
+    state.cars.lock().unwrap().push(car.clone());
+    
+    let command = navigation::get_straight_line_command(&car.start, &car.dest);
+    let command_body = format!(
+        "license={}&speed={:.2}&direction_x={:.2}&direction_y={:.2}",
+        license, command.speed, command.direction_x, command.direction_y
+    );
+    
+    let car_url = url.clone();
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let route_url = format!("{}/set-route", car_url);
+        match client
+            .post(&route_url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(command_body)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                println!("Command sent to car server {}: status {}", route_url, response.status());
+            }
+            Err(e) => {
+                println!("Failed to send command to car server {}: {}", route_url, e);
+            }
+        }
+    });
+    
     forward_car(license.clone(), url.clone());
     let response_body = format!("Car registered: {} url={}", license, url);
     HttpResponse::Ok()

@@ -1,6 +1,8 @@
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, web};
 use std::sync::{Arc, Mutex};
 
+const FORWARD_ENDPOINT: &str = "http://127.0.0.1:9000/car-registered";
+
 #[derive(Clone)]
 struct Point {
     x: f64,
@@ -16,6 +18,20 @@ struct Car {
 
 struct AppState {
     cars: Mutex<Vec<Car>>,
+}
+
+fn forward_car(license: String, url: String, start_x: f64, start_y: f64, dest_x: f64, dest_y: f64) {
+    tokio::spawn(async move {
+        let body = format!(
+            "license={}&url={}&start_x={}&start_y={}&dest_x={}&dest_y={}",
+            license, url, start_x, start_y, dest_x, dest_y
+        );
+        let client = reqwest::Client::new();
+        match client.post(FORWARD_ENDPOINT).body(body).send().await {
+            Ok(_) => {}
+            Err(e) => eprintln!("Failed to forward car to {}: {}", FORWARD_ENDPOINT, e),
+        }
+    });
 }
 
 async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResponse {
@@ -56,6 +72,14 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
         car.license, car.url, car.start.x, car.start.y, car.dest.x, car.dest.y
     );
     state.cars.lock().unwrap().push(car);
+    forward_car(
+        license.clone(),
+        url.clone(),
+        start_x,
+        start_y,
+        dest_x,
+        dest_y,
+    );
     let response_body = format!("Car registered: {} url={}", license, url);
     HttpResponse::Ok()
         .content_type("text/plain")

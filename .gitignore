@@ -1,2 +1,3 @@
 *.json
 bin/
+hive_mind_server/target/

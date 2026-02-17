@@ -1,12 +1,14 @@
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, web};
 use std::sync::{Arc, Mutex};
 
+mod navigation;
+
 const FORWARD_ENDPOINT: &str = "http://127.0.0.1:9000/car-registered";
 
 #[derive(Clone)]
-struct Point {
-    x: f64,
-    y: f64,
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
 }
 
 struct Car {

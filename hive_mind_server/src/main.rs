@@ -20,12 +20,9 @@ struct AppState {
     cars: Mutex<Vec<Car>>,
 }
 
-fn forward_car(license: String, url: String, start_x: f64, start_y: f64, dest_x: f64, dest_y: f64) {
+fn forward_car(license: String, url: String) {
     tokio::spawn(async move {
-        let body = format!(
-            "license={}&url={}&start_x={}&start_y={}&dest_x={}&dest_y={}",
-            license, url, start_x, start_y, dest_x, dest_y
-        );
+        let body = format!("license={}&url={}", license, url);
         let client = reqwest::Client::new();
         match client.post(FORWARD_ENDPOINT).body(body).send().await {
             Ok(_) => {}
@@ -72,14 +69,7 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
         car.license, car.url, car.start.x, car.start.y, car.dest.x, car.dest.y
     );
     state.cars.lock().unwrap().push(car);
-    forward_car(
-        license.clone(),
-        url.clone(),
-        start_x,
-        start_y,
-        dest_x,
-        dest_y,
-    );
+    forward_car(license.clone(), url.clone());
     let response_body = format!("Car registered: {} url={}", license, url);
     HttpResponse::Ok()
         .content_type("text/plain")

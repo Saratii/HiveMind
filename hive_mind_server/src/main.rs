@@ -9,6 +9,7 @@ struct Point {
 
 struct Car {
     license: String,
+    url: String,
     start: Point,
     dest: Point,
 }
@@ -19,6 +20,7 @@ struct AppState {
 
 async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResponse {
     let mut license = String::new();
+    let mut url = String::new();
     let mut start_x = 0.0f64;
     let mut start_y = 0.0f64;
     let mut dest_x = 0.0f64;
@@ -29,6 +31,7 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
         let val = kv.next().unwrap_or("");
         match key {
             "license" => license = val.to_string(),
+            "url" => url = val.to_string(),
             "start_x" => start_x = val.parse().unwrap_or(0.0),
             "start_y" => start_y = val.parse().unwrap_or(0.0),
             "dest_x" => dest_x = val.parse().unwrap_or(0.0),
@@ -38,6 +41,7 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
     }
     let car = Car {
         license: license.clone(),
+        url: url.clone(),
         start: Point {
             x: start_x,
             y: start_y,
@@ -48,11 +52,11 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
         },
     };
     println!(
-        "Car registered: {} ({:.2}, {:.2}) -> ({:.2}, {:.2})",
-        car.license, car.start.x, car.start.y, car.dest.x, car.dest.y
+        "Car registered: {} url={} ({:.2}, {:.2}) -> ({:.2}, {:.2})",
+        car.license, car.url, car.start.x, car.start.y, car.dest.x, car.dest.y
     );
     state.cars.lock().unwrap().push(car);
-    let response_body = format!("Car registered: {}", license);
+    let response_body = format!("Car registered: {} url={}", license, url);
     HttpResponse::Ok()
         .content_type("text/plain")
         .body(response_body)

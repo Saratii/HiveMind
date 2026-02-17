@@ -179,9 +179,10 @@ typedef struct {
 
 static void alloc_buf(uv_handle_t *h, size_t suggested, uv_buf_t *buf) {
     (void)h;
-    buf->base = (char*)malloc(suggested);
-    buf->len = suggested;
+    buf->base = (char*)malloc(suggested + 1);
+    buf->len = suggested + 1;
 }
+
 
 static void on_car_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
     CarClient *cc = (CarClient*)stream;
@@ -206,15 +207,12 @@ static void on_car_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_
         char body[512];
         snprintf(body, sizeof(body),
             "{"
-              "\"license\":\"%s\","
-              "\"x\":%.3f,\"y\":%.3f,"
-              "\"vx\":%.3f,\"vy\":%.3f,"
-              "\"dest_x\":%.3f,\"dest_y\":%.3f,"
-              "\"target_speed\":%.3f"
+                "\"license\":\"%s\","
+                "\"x\":%.3f,\"y\":%.3f,"
+                "\"dest_x\":%.3f,\"dest_y\":%.3f"
             "}",
-            car->license, car->x, car->y, car->vx, car->vy,
-            car->dest_x, car->dest_y, car->target_speed
-        );
+           car->license, car->x, car->y, car->dest_x, car->dest_y
+);
         write_http_response(stream, "HTTP/1.1 200 OK", "application/json", body);
     }
     else if (starts_with(req, "POST /command")) {
@@ -310,15 +308,20 @@ static void on_http_connected(uv_connect_t *req, int status) {
     uv_write(&hc->wr, req->handle, &b, 1, on_http_write_done);
 }
 
-static void post_register_car(const char *host_ip, int port, CarRuntime *car) {
-    // Build form body to match your server.c
-    char body[256];
+static void post_register_car(const char *host_ip, int port, CarRuntime *car, int listen_port) {
+    // Build URL that points back to THIS car node
+    char car_url[128];
+    snprintf(car_url, sizeof(car_url), "http://127.0.0.1:%d", listen_port);
+
+    // Build form body to match server's register_car parser:
+    // license, url, start_x, start_y, dest_x, dest_y
+    char body[512];
     snprintf(body, sizeof(body),
-        "license=%s&start_x=%.3f&start_y=%.3f&dest_x=%.3f&dest_y=%.3f",
-        car->license, car->x, car->y, car->dest_x, car->dest_y
+        "license=%s&url=%s&start_x=%.3f&start_y=%.3f&dest_x=%.3f&dest_y=%.3f",
+        car->license, car_url, car->x, car->y, car->dest_x, car->dest_y
     );
 
-    char req[512];
+    char req[1024];
     int body_len = (int)strlen(body);
     snprintf(req, sizeof(req),
         "POST /register-car HTTP/1.1\r\n"
@@ -334,7 +337,8 @@ static void post_register_car(const char *host_ip, int port, CarRuntime *car) {
     HttpClient *hc = (HttpClient*)calloc(1, sizeof(HttpClient));
     if (!hc) return;
 
-    hc->req_mem = _strdup(req);
+    // NOTE: _strdup is Windows-only. On mac/linux use strdup
+    hc->req_mem = strdup(req);
     if (!hc->req_mem) { free(hc); return; }
 
     uv_tcp_init(g_loop, &hc->tcp);
@@ -342,7 +346,6 @@ static void post_register_car(const char *host_ip, int port, CarRuntime *car) {
 
     struct sockaddr_in dest;
     uv_ip4_addr(host_ip, port, &dest);
-
     uv_tcp_connect(&hc->conn, &hc->tcp, (const struct sockaddr*)&dest, on_http_connected);
 }
 
@@ -358,9 +361,12 @@ static void on_sim_timer(uv_timer_t *t) {
     static int counter = 0;
     counter++;
     if (counter % 60 == 0) {
-        printf("[car %s] pos=(%.2f, %.2f) vel=(%.2f, %.2f) dest=(%.2f, %.2f) target_speed=%.2f\n",
-            car->license, car->x, car->y, car->vx, car->vy, car->dest_x, car->dest_y, car->target_speed);
+    double speed = sqrt(car->vx*car->vx + car->vy*car->vy);
+    if (speed > 0.01) {
+        printf("[car %s] pos=(%.2f, %.2f) dest=(%.2f, %.2f)\n",
+            car->license, car->x, car->y, car->dest_x, car->dest_y);
     }
+  }
 }
 
 int main(int argc, char **argv) {
@@ -405,7 +411,7 @@ int main(int argc, char **argv) {
     printf("[car_node] listening on http://0.0.0.0:%d\n", listen_port);
 
     // Register with central server (matches your current server.c)
-    post_register_car("127.0.0.1", 8080, &car);
+    post_register_car("127.0.0.1", 8080, &car, listen_port);
 
     // Start simulation timer (16ms)
     uv_timer_t sim;

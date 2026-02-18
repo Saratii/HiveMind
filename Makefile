@@ -1,31 +1,27 @@
-VCPKG_ROOT = C:/vcpkg
+# Mac-friendly Makefile (vehicle emulator / car node)
+# Usage:
+#   make car_node
+#   make clean
 
-BIN_DIR = bin
+BIN_DIR := bin
 
-CITY_MAP_TARGET = $(BIN_DIR)/city_map.exe
-CITY_MAP_SRC = hive_mind_server/city_map.c hive_mind_server/city_constants.c
+CAR_NODE_TARGET := $(BIN_DIR)/car_node
+CAR_NODE_SRC := vehicle_emulator/cars_node.cpp vehicle_emulator/cars.c
 
-SERVER_TARGET = $(BIN_DIR)/server.exe
-SERVER_SRC = hive_mind_server/server.c hive_mind_server/car.c
+# Homebrew prefixes differ between Apple Silicon and Intel
+BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
+CFLAGS := -O2 -std=c++17 -I$(BREW_PREFIX)/include
+LDFLAGS := -L$(BREW_PREFIX)/lib -luv -lm
 
-CFLAGS = -O2 -std=c11 -I$(VCPKG_ROOT)/installed/x64-windows/include
-LDFLAGS = -L$(VCPKG_ROOT)/installed/x64-windows/lib \
-          -luv \
-          -lraylib -lopengl32 -lgdi32 -lwinmm -lm
+.PHONY: all car_node clean
 
-DLL_DIR = $(VCPKG_ROOT)/installed/x64-windows/bin
+all: car_node
 
-all: $(CITY_MAP_TARGET) $(SERVER_TARGET)
+car_node: $(CAR_NODE_TARGET)
 
-$(CITY_MAP_TARGET): $(CITY_MAP_SRC)
-	if not exist $(BIN_DIR) mkdir $(BIN_DIR)
-	gcc $(CFLAGS) $(CITY_MAP_SRC) -o $(CITY_MAP_TARGET) $(LDFLAGS)
-	copy "$(DLL_DIR)\*.dll" "$(BIN_DIR)\"
-
-$(SERVER_TARGET): $(SERVER_SRC)
-	if not exist $(BIN_DIR) mkdir $(BIN_DIR)
-	gcc $(CFLAGS) $(SERVER_SRC) -o $(SERVER_TARGET) $(LDFLAGS)
-	copy "$(DLL_DIR)\*.dll" "$(BIN_DIR)\"
+$(CAR_NODE_TARGET): $(CAR_NODE_SRC)
+	@mkdir -p $(BIN_DIR)
+	c++ $(CFLAGS) $(CAR_NODE_SRC) -o $(CAR_NODE_TARGET) $(LDFLAGS)
 
 clean:
-	del /Q "$(BIN_DIR)\city_map.exe" "$(BIN_DIR)\server.exe" "$(BIN_DIR)\*.dll" 2>NUL
+	rm -f $(CAR_NODE_TARGET)

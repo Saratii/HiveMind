@@ -108,7 +108,6 @@ async fn main() -> std::io::Result<()> {
             .default_service(web::to(fallback))
     })
     .bind("0.0.0.0:8080")?
-    .bind("0.0.0.0:5050")?
     .run()
     .await
 }

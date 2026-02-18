@@ -188,6 +188,7 @@ static void on_car_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_
     CarClient *cc = (CarClient*)stream;
     CarRuntime *car = cc->car;
 
+    // EOF / error
     if (nread <= 0) {
         if (buf->base) free(buf->base);
         if (nread < 0) {
@@ -196,62 +197,101 @@ static void on_car_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_
         return;
     }
 
-    // Ensure request is null-terminated
+    // Ensure request is null-terminated (alloc_buf gave us +1)
     buf->base[nread] = '\0';
     char *req = buf->base;
 
-    // Routes:
-    // GET /status
-    // POST /command (form: speed=..&dest_x=..&dest_y=..)
+    // -------- GET /status --------
     if (starts_with(req, "GET /status")) {
-        char body[512];
+        char body[256];
         snprintf(body, sizeof(body),
             "{"
-                "\"license\":\"%s\","
-                "\"x\":%.3f,\"y\":%.3f,"
-                "\"dest_x\":%.3f,\"dest_y\":%.3f"
+              "\"license\":\"%s\","
+              "\"x\":%.3f,\"y\":%.3f,"
+              "\"dest_x\":%.3f,\"dest_y\":%.3f"
             "}",
-           car->license, car->x, car->y, car->dest_x, car->dest_y
-);
+            car->license, car->x, car->y, car->dest_x, car->dest_y
+        );
+
         write_http_response(stream, "HTTP/1.1 200 OK", "application/json", body);
+        free(buf->base);
+        return;
     }
-    else if (starts_with(req, "POST /command")) {
+
+    // -------- POST /set-route --------
+    if (starts_with(req, "POST /set-route")) {
         char *body = find_body(req);
         if (!body) {
             write_http_response(stream, "HTTP/1.1 400 Bad Request", "text/plain", "missing body");
-        } else {
-            // parse form-encoded values if present
-            // accepted keys: speed, dest_x, dest_y
-            // example: speed=8.5&dest_x=100&dest_y=0
-            double new_speed = car->target_speed;
-            double new_dx = car->dest_x;
-            double new_dy = car->dest_y;
-
-            // Very simple parsing: try sscanf in common order first, then fallback searches
-            // sprint-safe: keep consistent on client side
-            if (strstr(body, "speed=") != NULL) {
-                sscanf(strstr(body, "speed="), "speed=%lf", &new_speed);
-            }
-            if (strstr(body, "dest_x=") != NULL) {
-                sscanf(strstr(body, "dest_x="), "dest_x=%lf", &new_dx);
-            }
-            if (strstr(body, "dest_y=") != NULL) {
-                sscanf(strstr(body, "dest_y="), "dest_y=%lf", &new_dy);
-            }
-
-            car->target_speed = new_speed;
-            car->dest_x = new_dx;
-            car->dest_y = new_dy;
-
-            write_http_response(stream, "HTTP/1.1 200 OK", "text/plain", "ok");
+            free(buf->base);
+            return;
         }
-    }
-    else {
-        write_http_response(stream, "HTTP/1.1 404 Not Found", "text/plain", "not found");
+
+        // Defaults (keep current unless provided)
+        char license_in[32] = {0};
+        double speed = car->target_speed;
+        double dir_x = 0.0;
+        double dir_y = 0.0;
+
+        // Parse form fields (server sends: license, speed, direction_x, direction_y)
+        if (strstr(body, "license=")) {
+            // copy license value until '&' or end
+            const char *p = strstr(body, "license=") + strlen("license=");
+            size_t i = 0;
+            while (p[i] && p[i] != '&' && i < sizeof(license_in)-1) {
+                license_in[i] = p[i];
+                i++;
+            }
+            license_in[i] = '\0';
+        }
+
+        if (strstr(body, "speed="))
+            sscanf(strstr(body, "speed="), "speed=%lf", &speed);
+
+        if (strstr(body, "direction_x="))
+            sscanf(strstr(body, "direction_x="), "direction_x=%lf", &dir_x);
+
+        if (strstr(body, "direction_y="))
+            sscanf(strstr(body, "direction_y="), "direction_y=%lf", &dir_y);
+
+        // License check (if provided)
+        if (license_in[0] != '\0' && strcmp(license_in, car->license) != 0) {
+            write_http_response(stream, "HTTP/1.1 404 Not Found", "text/plain", "wrong license for this car");
+            free(buf->base);
+            return;
+        }
+
+        // Normalize direction (avoid huge/zero vectors)
+        double mag = sqrt(dir_x*dir_x + dir_y*dir_y);
+        if (mag < 1e-9) {
+            write_http_response(stream, "HTTP/1.1 400 Bad Request", "text/plain", "direction is zero");
+            free(buf->base);
+            return;
+        }
+        dir_x /= mag;
+        dir_y /= mag;
+
+        // Apply command:
+        // - set target speed
+        // - set a far-away destination in that direction so your existing sim moves
+        car->target_speed = speed;
+        const double LOOKAHEAD = 100.0; // meters ahead
+        car->dest_x = car->x + dir_x * LOOKAHEAD;
+        car->dest_y = car->y + dir_y * LOOKAHEAD;
+
+        printf("[car %s] new route -> dir=(%.2f, %.2f) speed=%.2f\n",
+               car->license, dir_x, dir_y, speed);
+
+        write_http_response(stream, "HTTP/1.1 200 OK", "text/plain", "route updated");
+        free(buf->base);
+        return;
     }
 
+    // -------- fallback --------
+    write_http_response(stream, "HTTP/1.1 404 Not Found", "text/plain", "not found");
     free(buf->base);
 }
+
 
 static void on_new_car_conn(uv_stream_t *server, int status) {
     if (status < 0) return;

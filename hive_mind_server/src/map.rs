@@ -21,12 +21,10 @@ pub struct Segment {
     pub pts: Vec<[f64; 2]>,
 }
 
-//struct for a parking lot, defined by a polygon and spots for demo
+//struct for a parking lot, defined by a polygon of points
 #[derive(Debug, Deserialize, Clone)]
 pub struct ParkingLot {
     pub pts: Vec<[f64; 2]>,
-    #[serde(default)]
-    pub spots: Vec<[f64; 2]>,
 }
 
 //struct for the city map, containing a list of segments and parking lots
@@ -116,41 +114,6 @@ impl CityMap {
                     to: from,
                     length,
                 });
-            }
-        }
-        let road_node_count = nodes.len();
-        // Add parking lot spots as graph nodes, connected to nearest road node
-        for lot in &self.parking_lots {
-            for spot in &lot.spots {
-                let (sx, sy) = (spot[0], spot[1]);
-                let spot_node = find_or_add(&mut nodes, sx, sy);
-                let nearest = nodes[..road_node_count]
-                    .iter()
-                    .enumerate()
-                    .min_by(|(_, a), (_, b)| {
-                        (a.x - sx)
-                            .hypot(a.y - sy)
-                            .partial_cmp(&(b.x - sx).hypot(b.y - sy))
-                            .unwrap()
-                    });
-                if let Some((road_idx, road_node)) = nearest {
-                    if spot_node == road_idx {
-                        continue;
-                    }
-                    let length = (road_node.x - sx).hypot(road_node.y - sy);
-                    if length < 200.0 {
-                        edges.push(GraphEdge {
-                            from: spot_node,
-                            to: road_idx,
-                            length,
-                        });
-                        edges.push(GraphEdge {
-                            from: road_idx,
-                            to: spot_node,
-                            length,
-                        });
-                    }
-                }
             }
         }
         let mut adjacency = vec![Vec::new(); nodes.len()];

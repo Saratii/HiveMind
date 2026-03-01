@@ -30,7 +30,6 @@ const REGISTRY_CAR_REGISTERED: &str = "/car-registered";
 const CAR_COMMAND: &str = "/command";
 const CAR_POSITION: &str = "/position";
 const ENDPOINT_REGISTER_CAR: &str = "/register-car";
-const ENDPOINT_PARKING_SPOTS: &str = "/parking-spots";
 const WAYPOINT_PROXIMITY: f64 = 10.0;
 const POLL_EARLY_SECS: f64 = 2.0;
 
@@ -49,11 +48,10 @@ struct Car {
     dest: Point,
 }
 
-//struct for application state, containing registered cars, city graph, and parking lots
+//struct for application state, containing registered cars and the city graph
 struct AppState {
     cars: Mutex<Vec<Car>>,
     city_graph: CityGraph,
-    city_map: CityMap,
 }
 
 // TODO: Implement actual roadway validation logic
@@ -296,24 +294,6 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
         .body(format!("Car registered: {} url={}", license, url))
 }
 
-//endpoint for getting demo parking lot spots (2 lots, 3 spots each)
-//returns x1,y1,x2,y2,... for use as start/dest in register-car
-async fn parking_spots(state: web::Data<Arc<AppState>>) -> HttpResponse {
-    let spots: Vec<String> = state
-        .city_map
-        .parking_lots
-        .iter()
-        .flat_map(|lot| {
-            lot.spots
-                .iter()
-                .flat_map(|s| [s[0].to_string(), s[1].to_string()])
-        })
-        .collect();
-    HttpResponse::Ok()
-        .content_type("text/plain")
-        .body(spots.join(","))
-}
-
 //endpoint for getting the total count of registered cars
 //inputs: HTTP GET request
 //returns: HTTP response with the total number of registered cars
@@ -350,7 +330,6 @@ async fn main() -> std::io::Result<()> {
     let state = Arc::new(AppState {
         cars: Mutex::new(Vec::new()),
         city_graph,
-        city_map,
     });
     println!("Server running on http://{}", BIND_ADDR);
     HttpServer::new(move || {
@@ -358,7 +337,6 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(state)
             .route(ENDPOINT_REGISTER_CAR, web::post().to(register_car))
-            .route(ENDPOINT_PARKING_SPOTS, web::get().to(parking_spots))
             .route(ENDPOINT_HEALTH, web::get().to(health))
             .route(ENDPOINT_CAR_COUNT, web::get().to(car_count))
     })

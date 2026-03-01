@@ -474,8 +474,6 @@ int main(int argc, char **argv) {
     car.target_speed = target_speed;
     car.max_accel = 3.0; // m/s^2 (tweakable)
 
-    // (Optional) initialize your metadata struct too (not required for server right now)
-    car_init(&car.meta, "1HGBH41JXMN109186", 2022, "Toyota", "Camry", start_x, start_y);
 
     // Start car listening server
     uv_tcp_t car_server;

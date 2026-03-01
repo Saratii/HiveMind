@@ -2,7 +2,7 @@
 prologue
 Name of program: cars_node.cpp
 Description: Initialize a car structure, copies strings and sets starting positions, and velocity/acceleration. All server API and commands are handled in this file
-Author: Saurav Renju / Alec Slavik
+Author: Saurav Renju / Alec Slavik / Muhammad Ibrahim 
 Date Created: 2/11/2026
 Date Revised: 3/1/2026
 Revision History: Included in the numerous sprint artifacts.
@@ -36,7 +36,13 @@ typedef struct {
     double x, y;
     double vx, vy;
 
-    // Destination
+    // Direction vector (normalized, which way car is facing)
+    double dir_x, dir_y;
+
+    // Target direction for smooth turning (normalized)
+    double target_dir_x, target_dir_y;
+
+    // Destination (used for movement along current direction)
     double dest_x, dest_y;
 
     // Commanded speed (m/s)
@@ -44,6 +50,12 @@ typedef struct {
 
     // Limits
     double max_accel; // m/s^2
+
+    // Turn rate: radians per second for smooth turns
+    double turn_rate;
+
+    // Whether car has been approved to enter roadway (stays stopped until approved)
+    int approved;
 
     // Car metadata (optional)
     Car meta;
@@ -138,26 +150,64 @@ static void write_http_response(
 
 // ---------------- Car simulation ----------------
 
-static void car_set_velocity_toward_dest(CarRuntime *c, double dt) {
-    double dx = c->dest_x - c->x;
-    double dy = c->dest_y - c->y;
-    double dist = sqrt(dx*dx + dy*dy);
+#define PI 3.14159265358979323846
 
-    if (dist < 0.5) {
-        // arrived: stop
+// Smoothly interpolate direction vector toward target (gradual turn like a real car)
+static void update_direction(CarRuntime *c, double dt) {
+    double dot = c->dir_x * c->target_dir_x + c->dir_y * c->target_dir_y;
+    double cross = c->dir_x * c->target_dir_y - c->dir_y * c->target_dir_x;
+
+    // Clamp dot for acos safety
+    if (dot > 1.0) dot = 1.0;
+    if (dot < -1.0) dot = -1.0;
+
+    double angle_diff = atan2(cross, dot);
+    double max_angle = c->turn_rate * dt;
+
+    if (fabs(angle_diff) < max_angle) {
+        c->dir_x = c->target_dir_x;
+        c->dir_y = c->target_dir_y;
+        return;
+    }
+
+    double step = (angle_diff > 0) ? max_angle : -max_angle;
+    double cos_s = cos(step);
+    double sin_s = sin(step);
+    double nx = c->dir_x * cos_s - c->dir_y * sin_s;
+    double ny = c->dir_x * sin_s + c->dir_y * cos_s;
+
+    double mag = sqrt(nx*nx + ny*ny);
+    if (mag > 1e-9) {
+        c->dir_x = nx / mag;
+        c->dir_y = ny / mag;
+    }
+}
+
+static void car_set_velocity_toward_dest(CarRuntime *c, double dt) {
+    if (!c->approved) {
         c->vx = 0.0;
         c->vy = 0.0;
         return;
     }
 
-    // direction to dest
-    double ux = dx / dist;
-    double uy = dy / dist;
+    // Smooth turn: gradually update direction toward target
+    update_direction(c, dt);
 
-    // current speed
+    double dx = c->dest_x - c->x;
+    double dy = c->dest_y - c->y;
+    double dist = sqrt(dx*dx + dy*dy);
+
+    if (dist < 0.5 && c->target_speed < 0.01) {
+        c->vx = 0.0;
+        c->vy = 0.0;
+        return;
+    }
+
+    // Use current direction vector (smooth turning) not raw dest direction
+    double ux = c->dir_x;
+    double uy = c->dir_y;
+
     double speed = sqrt(c->vx*c->vx + c->vy*c->vy);
-
-    // accelerate/decelerate toward target_speed with max_accel
     double desired = c->target_speed;
     double delta = desired - speed;
     double max_dv = c->max_accel * dt;
@@ -172,16 +222,9 @@ static void car_set_velocity_toward_dest(CarRuntime *c, double dt) {
 }
 
 static void sim_tick(CarRuntime *c, double dt) {
-    // Update velocity based on target and destination
     car_set_velocity_toward_dest(c, dt);
-
-    // Integrate position
     c->x += c->vx * dt;
     c->y += c->vy * dt;
-
-    // Tiny lane drift (optional, super small, keeps requirement satisfied without chaos)
-    // Feel free to remove if you want dead-straight.
-    // c->y += 0.02 * sin(uv_hrtime() / 1e9);
 }
 
 // ---------------- Car listening server (libuv) ----------------
@@ -224,9 +267,10 @@ static void on_car_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_
             "{"
               "\"license\":\"%s\","
               "\"x\":%.3f,\"y\":%.3f,"
+              "\"dir_x\":%.4f,\"dir_y\":%.4f,"
               "\"dest_x\":%.3f,\"dest_y\":%.3f"
             "}",
-            car->license, car->x, car->y, car->dest_x, car->dest_y
+            car->license, car->x, car->y, car->dir_x, car->dir_y, car->dest_x, car->dest_y
         );
 
         write_http_response(stream, "HTTP/1.1 200 OK", "application/json", body);
@@ -234,8 +278,17 @@ static void on_car_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_
         return;
     }
 
-    // -------- POST /set-route --------
-    if (starts_with(req, "POST /set-route")) {
+    // -------- GET /position (server polls for current position) --------
+    if (starts_with(req, "GET /position")) {
+        char body[128];
+        snprintf(body, sizeof(body), "x=%.6f&y=%.6f", car->x, car->y);
+        write_http_response(stream, "HTTP/1.1 200 OK", "text/plain", body);
+        free(buf->base);
+        return;
+    }
+
+    // -------- POST /command (server sends: type=set_route|stop|speed|left|right) --------
+    if (starts_with(req, "POST /command") || starts_with(req, "POST /set-route")) {
         char *body = find_body(req);
         if (!body) {
             write_http_response(stream, "HTTP/1.1 400 Bad Request", "text/plain", "missing body");
@@ -243,16 +296,23 @@ static void on_car_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_
             return;
         }
 
-        // Defaults (keep current unless provided)
         char license_in[32] = {0};
+        char cmd_type[32] = {0};
         double speed = car->target_speed;
-        double dir_x = 0.0;
-        double dir_y = 0.0;
+        double dir_x = car->target_dir_x;
+        double dir_y = car->target_dir_y;
 
-        // Parse form fields (server sends: license, speed, direction_x, direction_y)
+        if (strstr(body, "type=")) {
+            const char *p = strstr(body, "type=") + 5;
+            size_t i = 0;
+            while (p[i] && p[i] != '&' && i < sizeof(cmd_type)-1) {
+                cmd_type[i] = p[i];
+                i++;
+            }
+            cmd_type[i] = '\0';
+        }
         if (strstr(body, "license=")) {
-            // copy license value until '&' or end
-            const char *p = strstr(body, "license=") + strlen("license=");
+            const char *p = strstr(body, "license=") + 8;
             size_t i = 0;
             while (p[i] && p[i] != '&' && i < sizeof(license_in)-1) {
                 license_in[i] = p[i];
@@ -260,45 +320,89 @@ static void on_car_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_
             }
             license_in[i] = '\0';
         }
-
         if (strstr(body, "speed="))
             sscanf(strstr(body, "speed="), "speed=%lf", &speed);
-
         if (strstr(body, "direction_x="))
             sscanf(strstr(body, "direction_x="), "direction_x=%lf", &dir_x);
-
         if (strstr(body, "direction_y="))
             sscanf(strstr(body, "direction_y="), "direction_y=%lf", &dir_y);
 
-        // License check (if provided)
         if (license_in[0] != '\0' && strcmp(license_in, car->license) != 0) {
-            write_http_response(stream, "HTTP/1.1 404 Not Found", "text/plain", "wrong license for this car");
+            write_http_response(stream, "HTTP/1.1 404 Not Found", "text/plain", "wrong license");
             free(buf->base);
             return;
         }
 
-        // Normalize direction (avoid huge/zero vectors)
-        double mag = sqrt(dir_x*dir_x + dir_y*dir_y);
-        if (mag < 1e-9) {
-            write_http_response(stream, "HTTP/1.1 400 Bad Request", "text/plain", "direction is zero");
+        if (strcmp(cmd_type, "stop") == 0) {
+            car->target_speed = 0.0;
+            printf("[car %s] stop\n", car->license);
+            write_http_response(stream, "HTTP/1.1 200 OK", "text/plain", "stopped");
             free(buf->base);
             return;
         }
-        dir_x /= mag;
-        dir_y /= mag;
 
-        // Apply command:
-        // - set target speed
-        // - set a far-away destination in that direction so your existing sim moves
-        car->target_speed = speed;
-        const double LOOKAHEAD = 100.0; // meters ahead
-        car->dest_x = car->x + dir_x * LOOKAHEAD;
-        car->dest_y = car->y + dir_y * LOOKAHEAD;
+        if (strcmp(cmd_type, "speed") == 0) {
+            car->target_speed = speed;
+            printf("[car %s] speed=%.2f\n", car->license, speed);
+            write_http_response(stream, "HTTP/1.1 200 OK", "text/plain", "speed updated");
+            free(buf->base);
+            return;
+        }
 
-        printf("[car %s] new route -> dir=(%.2f, %.2f) speed=%.2f\n",
-               car->license, dir_x, dir_y, speed);
+        if (strcmp(cmd_type, "left") == 0) {
+            double nx = -car->target_dir_y;
+            double ny =  car->target_dir_x;
+            car->target_dir_x = nx;
+            car->target_dir_y = ny;
+            const double LOOKAHEAD = 100.0;
+            car->dest_x = car->x + car->target_dir_x * LOOKAHEAD;
+            car->dest_y = car->y + car->target_dir_y * LOOKAHEAD;
+            printf("[car %s] turn left -> dir=(%.2f, %.2f)\n", car->license, car->target_dir_x, car->target_dir_y);
+            write_http_response(stream, "HTTP/1.1 200 OK", "text/plain", "turning left");
+            free(buf->base);
+            return;
+        }
 
-        write_http_response(stream, "HTTP/1.1 200 OK", "text/plain", "route updated");
+        if (strcmp(cmd_type, "right") == 0) {
+            double nx =  car->target_dir_y;
+            double ny = -car->target_dir_x;
+            car->target_dir_x = nx;
+            car->target_dir_y = ny;
+            const double LOOKAHEAD = 100.0;
+            car->dest_x = car->x + car->target_dir_x * LOOKAHEAD;
+            car->dest_y = car->y + car->target_dir_y * LOOKAHEAD;
+            printf("[car %s] turn right -> dir=(%.2f, %.2f)\n", car->license, car->target_dir_x, car->target_dir_y);
+            write_http_response(stream, "HTTP/1.1 200 OK", "text/plain", "turning right");
+            free(buf->base);
+            return;
+        }
+
+        if (strcmp(cmd_type, "set_route") == 0 || cmd_type[0] == '\0') {
+            double mag = sqrt(dir_x*dir_x + dir_y*dir_y);
+            if (mag < 1e-9) {
+                write_http_response(stream, "HTTP/1.1 400 Bad Request", "text/plain", "direction is zero");
+                free(buf->base);
+                return;
+            }
+            dir_x /= mag;
+            dir_y /= mag;
+
+            car->target_speed = speed;
+            car->target_dir_x = dir_x;
+            car->target_dir_y = dir_y;
+            const double LOOKAHEAD = 100.0;
+            car->dest_x = car->x + dir_x * LOOKAHEAD;
+            car->dest_y = car->y + dir_y * LOOKAHEAD;
+
+            printf("[car %s] set_route -> dir=(%.2f, %.2f) speed=%.2f\n",
+                   car->license, dir_x, dir_y, speed);
+
+            write_http_response(stream, "HTTP/1.1 200 OK", "text/plain", "route updated");
+            free(buf->base);
+            return;
+        }
+
+        write_http_response(stream, "HTTP/1.1 400 Bad Request", "text/plain", "unknown command type");
         free(buf->base);
         return;
     }
@@ -336,15 +440,16 @@ static void on_new_car_conn(uv_stream_t *server, int status) {
 }
 
 // ---------------- Register with central server (simple libuv TCP client) ----------------
-// Represents a lightweight HTTP client using libuv. Used to send a POST request to the central server.
 typedef struct {
     uv_tcp_t tcp;
     uv_connect_t conn;
     uv_write_t wr;
     char *req_mem;
+    CarRuntime *car;
+    char resp_buf[4096];
+    size_t resp_len;
 } HttpClient;
 
-// Called when the TCP connection is fully closed. Frees allocated request memory and client struct.
 static void on_http_client_closed(uv_handle_t *h) {
     HttpClient *hc = (HttpClient*)h->data;
     if (hc) {
@@ -353,14 +458,38 @@ static void on_http_client_closed(uv_handle_t *h) {
     }
 }
 
-// Called after the HTTP request has been written to the socket.
-static void on_http_write_done(uv_write_t *wr, int status) {
-    (void)status;
-    // close after write; we don't need to read response for sprint 1
-    uv_close((uv_handle_t*)wr->handle, on_http_client_closed);
+static void on_http_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
+    HttpClient *hc = (HttpClient*)stream->data;
+
+    if (nread > 0 && buf->base && hc->resp_len + (size_t)nread < sizeof(hc->resp_buf)) {
+        memcpy(hc->resp_buf + hc->resp_len, buf->base, (size_t)nread);
+        hc->resp_len += (size_t)nread;
+        hc->resp_buf[hc->resp_len] = '\0';
+
+        int status = parse_http_status(hc->resp_buf);
+        if (status == 200 && hc->car) {
+            hc->car->approved = 1;
+            printf("[car_node] registration APPROVED - entering roadway\n");
+        } else if ((status == 403 || status == 400) && hc->car) {
+            hc->car->approved = 0;
+            printf("[car_node] registration DENIED (status %d) - staying off roadway\n", status);
+        }
+    }
+
+    if (buf->base) free(buf->base);
+
+    if (nread <= 0) {
+        uv_read_stop(stream);
+        uv_close((uv_handle_t*)stream, on_http_client_closed);
+    }
 }
 
-// Called when the TCP connection attempt completes.
+static void on_http_write_done(uv_write_t *wr, int status) {
+    (void)status;
+    HttpClient *hc = (HttpClient*)wr->handle->data;
+    uv_read_start(wr->handle, alloc_buf, on_http_read);
+}
+
 static void on_http_connected(uv_connect_t *req, int status) {
     if (status < 0) {
         fprintf(stderr, "[car_node] failed to connect to central server\n");
@@ -377,7 +506,19 @@ static void on_http_connected(uv_connect_t *req, int status) {
     uv_write(&hc->wr, req->handle, &b, 1, on_http_write_done);
 }
 
+// Parse HTTP status line "HTTP/1.1 200 OK" or "HTTP/1.1 403 Forbidden"
+static int parse_http_status(const char *resp) {
+    if (strstr(resp, "200"))
+        return 200;
+    if (strstr(resp, "403"))
+        return 403;
+    if (strstr(resp, "400"))
+        return 400;
+    return 0;
+}
+
 // Sends an HTTP POST request to register this car node with the central server.
+// Reads response and sets car->approved if status is 200.
 static void post_register_car(const char *host_ip, int port, CarRuntime *car, int listen_port) {
     // Build URL that points back to THIS car node
     char car_url[128];
@@ -411,10 +552,16 @@ static void post_register_car(const char *host_ip, int port, CarRuntime *car, in
     HttpClient *hc = (HttpClient*)calloc(1, sizeof(HttpClient));
     if (!hc) return;
 
-    // NOTE: _strdup is Windows-only. On mac/linux use strdup
+#ifdef _WIN32
+    hc->req_mem = _strdup(req);
+#else
     hc->req_mem = strdup(req);
+#endif
     if (!hc->req_mem) { free(hc); return; }
-    
+
+    hc->car = car;
+    hc->resp_len = 0;
+
     // Initialize the TCP handle for this HTTP client.
     uv_tcp_init(g_loop, &hc->tcp);
     // Store pointer to HttpClient inside libuv handle so we can retrieve it in callbacks.
@@ -451,29 +598,50 @@ static void on_sim_timer(uv_timer_t *t) {
 
 int main(int argc, char **argv) {
     // Usage:
-    //   car_node.exe <license> <listen_port> <start_x> <start_y> <dest_x> <dest_y> [target_speed]
-    const char *license = (argc >= 2) ? argv[1] : "CAR123";
-    int listen_port      = (argc >= 3) ? atoi(argv[2]) : 9001;
-    double start_x       = (argc >= 4) ? atof(argv[3]) : 0.0;
-    double start_y       = (argc >= 5) ? atof(argv[4]) : 0.0;
-    double dest_x        = (argc >= 6) ? atof(argv[5]) : 100.0;
-    double dest_y        = (argc >= 7) ? atof(argv[6]) : 0.0;
-    double target_speed  = (argc >= 8) ? atof(argv[7]) : 10.0;
+    //   car_node [--no-register] <license> <listen_port> <start_x> <start_y> <dest_x> <dest_y> [target_speed]
+    //   --no-register: do not auto-register; use curl to register manually
+    int arg_offset = 1;
+    int do_register = 1;
+    if (argc >= 2 && strcmp(argv[1], "--no-register") == 0) {
+        arg_offset = 2;
+        do_register = 0;
+        printf("[car_node] --no-register: will not auto-register (use curl)\n");
+    }
 
-    // Initialize libuv default event loop.
+    const char *license = (argc >= arg_offset + 1) ? argv[arg_offset] : "CAR123";
+    int listen_port     = (argc >= arg_offset + 2) ? atoi(argv[arg_offset + 1]) : 9001;
+    double start_x      = (argc >= arg_offset + 3) ? atof(argv[arg_offset + 2]) : 0.0;
+    double start_y      = (argc >= arg_offset + 4) ? atof(argv[arg_offset + 3]) : 0.0;
+    double dest_x       = (argc >= arg_offset + 5) ? atof(argv[arg_offset + 4]) : 100.0;
+    double dest_y       = (argc >= arg_offset + 6) ? atof(argv[arg_offset + 5]) : 0.0;
+    double target_speed = (argc >= arg_offset + 7) ? atof(argv[arg_offset + 6]) : 10.0;
+
     g_loop = uv_default_loop();
-    // Initialize car runtime state.
     CarRuntime car;
     memset(&car, 0, sizeof(car));
-    // Copy license safely.
     strncpy(car.license, license, sizeof(car.license)-1);
-    // Set initial position and destination.
     car.x = start_x; car.y = start_y;
     car.dest_x = dest_x; car.dest_y = dest_y;
-    // Set motion parameters.
     car.target_speed = target_speed;
-    car.max_accel = 3.0; // m/s^2 (tweakable)
+    car.max_accel = 3.0;
+    car.turn_rate = 0.5;  // ~30 deg/sec for smooth turns
+    car.approved = 0;     // stays off roadway until server approves
 
+    // Initial direction vector: from start toward dest (normalized)
+    double dx = dest_x - start_x;
+    double dy = dest_y - start_y;
+    double dist = sqrt(dx*dx + dy*dy);
+    if (dist > 1e-9) {
+        car.dir_x = dx / dist;
+        car.dir_y = dy / dist;
+        car.target_dir_x = car.dir_x;
+        car.target_dir_y = car.dir_y;
+    } else {
+        car.dir_x = 1.0; car.dir_y = 0.0;
+        car.target_dir_x = 1.0; car.target_dir_y = 0.0;
+    }
+
+    car_init(&car.meta, "1HGBH41JXMN109186", 2022, "Toyota", "Camry", start_x, start_y);
 
     // Start car listening server
     uv_tcp_t car_server;
@@ -493,8 +661,9 @@ int main(int argc, char **argv) {
     
     printf("[car_node] listening on http://0.0.0.0:%d\n", listen_port);
 
-    // Register with central server (matches your current server.c)
-    post_register_car("127.0.0.1", 8080, &car, listen_port);
+    if (do_register) {
+        post_register_car("127.0.0.1", 8080, &car, listen_port);
+    }
 
     // Start simulation timer (16ms)
     uv_timer_t sim;

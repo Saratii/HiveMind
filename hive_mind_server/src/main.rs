@@ -77,9 +77,9 @@ fn forward_car(license: String, url: String) {
     });
 }
 
-//send a command to the car's API endpoint asynchronously
-//inputs: reqwest client, car URL, list of (key, value) parameters to include in the command
-//returns: None
+// Send a command to the car's API endpoint asynchronously
+// inputs: reqwest client, car URL, list of (key, value) parameters to include in the command
+// returns: None
 async fn send_car_command(client: &reqwest::Client, car_url: &str, params: &[(&str, &str)]) {
     let body = params
         .iter()
@@ -283,15 +283,15 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
         println!("Car {} denied entry to roadway", car.license);
         return HttpResponse::Forbidden()
             .content_type("text/plain")
-            .body(format!("Car {} not allowed to enter roadway", license));
+            .body(format!("status=denied&reason=Car {} not allowed to enter roadway", license));
     }
     state.cars.lock().unwrap().push(car.clone());
-    println!("Car {} validated, starting drive loop", car.license);
+    println!("Car {} approved, starting drive loop", car.license);
     start_drive_loop(url.clone(), license.clone(), path, speed);
     forward_car(license.clone(), url.clone());
     HttpResponse::Ok()
         .content_type("text/plain")
-        .body(format!("Car registered: {} url={}", license, url))
+        .body(format!("status=approved&license={}&url={}", license, url))
 }
 
 //endpoint for getting the total count of registered cars

@@ -1,3 +1,13 @@
+/*
+prologue
+Name of program: cars.h
+Description: Header file for cars.c, defines the struct, init, and print functions
+Author: Saurav Renju / Alec Slavik
+Date Created: 2/11/2026
+Date Revised: 3/1/2026
+Revision History: Included in the numerous sprint artifacts.
+*/
+
 #pragma once
 
 #include <stdint.h>
@@ -27,3 +37,4 @@ void car_init(
 
 // Debug print
 void car_print(const Car *car);
+

@@ -1,4 +1,15 @@
-// vehicle_emulator/car_node.c
+/*
+prologue
+Name of program: cars_node.cpp
+Description: Initialize a car structure, copies strings and sets starting positions, and velocity/acceleration. All server API and commands are handled in this file
+Author: Saurav Renju / Alec Slavik
+Date Created: 2/11/2026
+Date Revised: 3/1/2026
+Revision History: Included in the numerous sprint artifacts.
+*/
+
+
+// vehicle_emulator/car_node.cpp
 // Sprint 1 car runtime:
 // - runs a tiny HTTP server (listening endpoint) for server -> car requests
 // - exposes:
@@ -64,18 +75,21 @@ static const char* find_header(const char *req, const char *name) {
     return NULL;
 }
 
+// Extracts the Content-Length header value from an HTTP request. Uses atoi() to convert the header value string to an integer.
 static int parse_content_length(const char *req) {
     const char *v = find_header(req, "Content-Length");
     if (!v) return 0;
     return atoi(v);
 }
 
+// Locates the start of the HTTP message body. HTTP headers end with "\r\n\r\n". Returns pointer to first byte of body, or NULL if not found.
 static char* find_body(char *req) {
     char *body = strstr(req, "\r\n\r\n");
     if (!body) return NULL;
     return body + 4;
 }
 
+// Builds and prepares an HTTP response header. Writes status line, content type, content length, and connection close. The actual body is sent separately after the header.
 static void write_http_response(
     uv_stream_t *stream,
     const char *status_line,
@@ -172,18 +186,20 @@ static void sim_tick(CarRuntime *c, double dt) {
 
 // ---------------- Car listening server (libuv) ----------------
 
+// Represents a connected client.
 typedef struct {
     uv_tcp_t handle;
     CarRuntime *car;
 } CarClient;
 
+// Called by libuv when memory is needed to read incoming data. Allocates a buffer of suggested size (+1 for safety/null termination).
 static void alloc_buf(uv_handle_t *h, size_t suggested, uv_buf_t *buf) {
     (void)h;
     buf->base = (char*)malloc(suggested + 1);
     buf->len = suggested + 1;
 }
 
-
+// Called when data is received from a connected client. Handles incoming commands and client disconnects.
 static void on_car_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
     CarClient *cc = (CarClient*)stream;
     CarRuntime *car = cc->car;
@@ -292,28 +308,35 @@ static void on_car_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_
     free(buf->base);
 }
 
-
+// Called by libuv when a new client attempts to connect to the server.
 static void on_new_car_conn(uv_stream_t *server, int status) {
+    // If connection attempt failed, ignore it.
     if (status < 0) return;
 
+    // Retrieve the underlying TCP server handle.
     uv_tcp_t *server_tcp = (uv_tcp_t*)server;
+    // Access the shared CarRuntime stored in server->data.
     CarRuntime *car = (CarRuntime*)server_tcp->data;
 
+    // Allocate memory for a new client connection wrapper.
     CarClient *client = (CarClient*)malloc(sizeof(CarClient));
     if (!client) return;
 
+    // Associate this client with the shared car state.
     client->car = car;
     uv_tcp_init(g_loop, &client->handle);
 
+    // Accept the incoming connection.
     if (uv_accept(server, (uv_stream_t*)&client->handle) == 0) {
         uv_read_start((uv_stream_t*)&client->handle, alloc_buf, on_car_client_read);
     } else {
+        // If accept fails, close and free the client handle.
         uv_close((uv_handle_t*)&client->handle, [](uv_handle_t *h){ free(h); });
     }
 }
 
 // ---------------- Register with central server (simple libuv TCP client) ----------------
-
+// Represents a lightweight HTTP client using libuv. Used to send a POST request to the central server.
 typedef struct {
     uv_tcp_t tcp;
     uv_connect_t conn;
@@ -321,6 +344,7 @@ typedef struct {
     char *req_mem;
 } HttpClient;
 
+// Called when the TCP connection is fully closed. Frees allocated request memory and client struct.
 static void on_http_client_closed(uv_handle_t *h) {
     HttpClient *hc = (HttpClient*)h->data;
     if (hc) {
@@ -329,12 +353,14 @@ static void on_http_client_closed(uv_handle_t *h) {
     }
 }
 
+// Called after the HTTP request has been written to the socket.
 static void on_http_write_done(uv_write_t *wr, int status) {
     (void)status;
     // close after write; we don't need to read response for sprint 1
     uv_close((uv_handle_t*)wr->handle, on_http_client_closed);
 }
 
+// Called when the TCP connection attempt completes.
 static void on_http_connected(uv_connect_t *req, int status) {
     if (status < 0) {
         fprintf(stderr, "[car_node] failed to connect to central server\n");
@@ -343,11 +369,15 @@ static void on_http_connected(uv_connect_t *req, int status) {
         return;
     }
 
+    // On successful connection, send the HTTP request.
     HttpClient *hc = (HttpClient*)req->handle->data;
+    // Wrap request string in a libuv buffer
     uv_buf_t b = uv_buf_init(hc->req_mem, (unsigned int)strlen(hc->req_mem));
+    // Write request to server
     uv_write(&hc->wr, req->handle, &b, 1, on_http_write_done);
 }
 
+// Sends an HTTP POST request to register this car node with the central server.
 static void post_register_car(const char *host_ip, int port, CarRuntime *car, int listen_port) {
     // Build URL that points back to THIS car node
     char car_url[128];
@@ -361,6 +391,7 @@ static void post_register_car(const char *host_ip, int port, CarRuntime *car, in
         car->license, car_url, car->x, car->y, car->dest_x, car->dest_y
     );
 
+    // Build full HTTP POST request
     char req[1024];
     int body_len = (int)strlen(body);
     snprintf(req, sizeof(req),
@@ -371,37 +402,46 @@ static void post_register_car(const char *host_ip, int port, CarRuntime *car, in
         "Connection: close\r\n"
         "\r\n"
         "%s",
-        host_ip, port, body_len, body
+        host_ip, port, // Central server host/port
+        body_len, // Length of form body
+        body // Form data
     );
 
+    // Allocate and zero-initialize a new HttpClient structure. calloc() ensures all fields (tcp, conn, wr, req_mem) start as NULL/0.
     HttpClient *hc = (HttpClient*)calloc(1, sizeof(HttpClient));
     if (!hc) return;
 
     // NOTE: _strdup is Windows-only. On mac/linux use strdup
     hc->req_mem = strdup(req);
     if (!hc->req_mem) { free(hc); return; }
-
+    
+    // Initialize the TCP handle for this HTTP client.
     uv_tcp_init(g_loop, &hc->tcp);
+    // Store pointer to HttpClient inside libuv handle so we can retrieve it in callbacks.
     hc->tcp.data = hc;
-
+    // Build destination IPv4 address structure.
     struct sockaddr_in dest;
     uv_ip4_addr(host_ip, port, &dest);
+    // Initiate asynchronous TCP connection to central server. When connected, on_http_connected() will be called.
     uv_tcp_connect(&hc->conn, &hc->tcp, (const struct sockaddr*)&dest, on_http_connected);
 }
 
 // ---------------- Simulation timer ----------------
-
+// Called every 16ms by libuv timer. Advances the physics simulation of the car.
 static void on_sim_timer(uv_timer_t *t) {
     CarRuntime *car = (CarRuntime*)t->data;
     const double dt = 0.016; // 16ms
 
+    // Advance simulation by dt seconds.
     sim_tick(car, dt);
 
     // optional console log every ~1s
     static int counter = 0;
     counter++;
     if (counter % 60 == 0) {
+    // Compute current speed magnitude.
     double speed = sqrt(car->vx*car->vx + car->vy*car->vy);
+    // Only log if the car is moving.
     if (speed > 0.01) {
         printf("[car %s] pos=(%.2f, %.2f) dest=(%.2f, %.2f)\n",
             car->license, car->x, car->y, car->dest_x, car->dest_y);
@@ -420,13 +460,17 @@ int main(int argc, char **argv) {
     double dest_y        = (argc >= 7) ? atof(argv[6]) : 0.0;
     double target_speed  = (argc >= 8) ? atof(argv[7]) : 10.0;
 
+    // Initialize libuv default event loop.
     g_loop = uv_default_loop();
-
+    // Initialize car runtime state.
     CarRuntime car;
     memset(&car, 0, sizeof(car));
+    // Copy license safely.
     strncpy(car.license, license, sizeof(car.license)-1);
+    // Set initial position and destination.
     car.x = start_x; car.y = start_y;
     car.dest_x = dest_x; car.dest_y = dest_y;
+    // Set motion parameters.
     car.target_speed = target_speed;
     car.max_accel = 3.0; // m/s^2 (tweakable)
 
@@ -436,18 +480,19 @@ int main(int argc, char **argv) {
     // Start car listening server
     uv_tcp_t car_server;
     uv_tcp_init(g_loop, &car_server);
+    // Attach CarRuntime to server handle for access in callbacks.
     car_server.data = &car;
-
+    // Bind to 0.0.0.0:<listen_port>
     struct sockaddr_in addr;
     uv_ip4_addr("0.0.0.0", listen_port, &addr);
     uv_tcp_bind(&car_server, (const struct sockaddr*)&addr, 0);
-
+    // Start listening for incoming connections.
     int r = uv_listen((uv_stream_t*)&car_server, 128, on_new_car_conn);
     if (r != 0) {
         fprintf(stderr, "car listen failed: %s\n", uv_strerror(r));
         return 1;
     }
-
+    
     printf("[car_node] listening on http://0.0.0.0:%d\n", listen_port);
 
     // Register with central server (matches your current server.c)
@@ -461,3 +506,4 @@ int main(int argc, char **argv) {
 
     return uv_run(g_loop, UV_RUN_DEFAULT);
 }
+

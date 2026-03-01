@@ -2,6 +2,16 @@
 #include <stdio.h>
 #include <string.h>
 
+/*
+prologue
+Name of program: cars.c
+Description: Initialize a car structure, copies strings and sets starting positions
+Author: Saurav Renju / Alec Slavik
+Date Created: 2/11/2026
+Date Revised: 3/1/2026
+Revision History: Included in the numerous sprint artifacts.
+*/
+
 void car_init(
     Car *car,
     const char *vin,
@@ -27,6 +37,10 @@ void car_init(
     car->y = start_y;
 }
 
+/*
+Car print is used to check if cars are working (debugging), and printing they're provided values
+*/
+
 void car_print(const Car *car)
 {
     printf("Car:\n");
@@ -38,6 +52,10 @@ void car_print(const Car *car)
 }
 
 #if defined(TEST_CAR_MAIN) || defined(test_car_main)
+
+/*
+Start main with a preset car
+*/
 int main(void)
 {
     Car car;
@@ -56,3 +74,4 @@ int main(void)
     return 0;
 }
 #endif
+

@@ -570,25 +570,28 @@
       ]
     }
   ],
-
-    "parking_lot_center": [
+    "parking_lot_A_center": [
     {
       "pts": [
         [900, -500]
       ]
-    },
+    }
+  ],
+    "parking_lot_B_center": [
     {
       "pts": [
         [-300, 500]
       ]
     }
   ],
-  "parking_lot_exit": [
+  "parking_lot_A_exit": [
     {
       "pts": [
         [900, -400]
       ]
-    },
+    }
+  ],
+  "parking_lot_B_exit": [
     {
        "pts": [
         [-300, 400]

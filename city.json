@@ -570,32 +570,8 @@
       ]
     }
   ],
-    "parking_lot_A_center": [
-    {
-      "pts": [
-        [900, -500]
-      ]
-    }
-  ],
-    "parking_lot_B_center": [
-    {
-      "pts": [
-        [-300, 500]
-      ]
-    }
-  ],
-  "parking_lot_A_exit": [
-    {
-      "pts": [
-        [900, -400]
-      ]
-    }
-  ],
-  "parking_lot_B_exit": [
-    {
-       "pts": [
-        [-300, 400]
-      ]
-    }
-  ]
+  "parking_lots": {
+    "A": {"center":[900,-500],"exit":[900,-400]},
+    "B": {"center":[-300,500],"exit":[-300,400]}
+  }
 }

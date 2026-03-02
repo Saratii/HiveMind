@@ -136,3 +136,30 @@ impl CityGraph {
             .unwrap_or(0)
     }
 }
+
+//tests
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Point;
+    use crate::pathfinding::compute_path;
+
+    #[test]
+    fn test_path_from_json_map() {
+        let map = CityMap::load("../city.json").expect("should load city map JSON");
+        let graph = map.build_graph();
+        let start = Point { x: 0.0, y: -1200.0 };
+        let dest = Point { x: 0.0, y: 1200.0 };
+        let path =
+            compute_path(&graph, &start, &dest).expect("should find path between two map nodes");
+        assert!(path.len() >= 2);
+        assert!((path.first().unwrap().x - start.x).abs() < 1.0);
+        assert!((path.first().unwrap().y - start.y).abs() < 1.0);
+        assert!((path.last().unwrap().x - dest.x).abs() < 1.0);
+        assert!((path.last().unwrap().y - dest.y).abs() < 1.0);
+        let last = path.last().unwrap();
+        assert_eq!(last.dir_x, 0.0);
+        assert_eq!(last.dir_y, 0.0);
+        assert_eq!(last.dist_to_next, 0.0);
+    }
+}

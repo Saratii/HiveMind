@@ -1,110 +1,56 @@
-/*
-prologue
-Name of program: main.rs
-Description: Main server logic for HiveMind
-Author: Maren Proplesch
-Date Created: 2/11/2026
-Date Revised: 3/1/2026
-Revision History: Included in the numerous sprint artifacts.
-Preconditions: Not applicable/Redundant
-Postconditions: Not applicable/Redundant
-*/
+// HiveMind server: car registration, pathfinding, command dispatch, position tracking.
 
-use actix_web::{App, HttpResponse, HttpServer, web};
+use actix_web::{web, App, HttpResponse, HttpServer};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 mod map;
 mod pathfinding;
 
-use map::{CityGraph, CityMap};
-use pathfinding::compute_path;
+use map::{CityGraph, CityMap, ParkingLotSpawns};
+use pathfinding::{compute_path, Waypoint};
 
-const DEFAULT_SPEED: f64 = 10.0;
-const ENDPOINT_HEALTH: &str = "/health";
-const ENDPOINT_CAR_COUNT: &str = "/car-count";
+const DEFAULT_SPEED: f64 = 75.0;
 const CITY_MAP_PATH: &str = "../city.json";
 const BIND_ADDR: &str = "0.0.0.0:8080";
-const REGISTRY_HOST: &str = "http://127.0.0.1:9000";
-const REGISTRY_CAR_REGISTERED: &str = "/car-registered";
-const CAR_COMMAND: &str = "/command";
-const CAR_POSITION: &str = "/position";
-const ENDPOINT_REGISTER_CAR: &str = "/register-car";
-const WAYPOINT_PROXIMITY: f64 = 10.0;
-const POLL_EARLY_SECS: f64 = 2.0;
+const WAYPOINT_PROXIMITY: f64 = 30.0;
+const POLL_INTERVAL_SECS: f64 = 0.5;
 
-//struct for a point with x and y coordinates
 #[derive(Clone)]
-pub struct Point {
-    pub x: f64,
-    pub y: f64,
-}
-
-//struct for a car with license plate, URL, and destination point
-#[derive(Clone)]
-struct Car {
+struct CarState {
     license: String,
     url: String,
-    dest: Point,
+    x: f64,
+    y: f64,
 }
 
-//struct for application state, containing registered cars and the city graph
 struct AppState {
-    cars: Mutex<Vec<Car>>,
+    cars: Mutex<HashMap<String, CarState>>,
     city_graph: CityGraph,
+    parking_spawns: ParkingLotSpawns,
 }
 
-// TODO: Implement actual roadway validation logic
-//should determine if a car can enter based on other cars in the immediate roadway, may also need to signal them to make roomn
-//inputs: car to validate
-//returns true if car is allowed to enter roadway, false otherwise
-fn validate_enter_roadway(_car: &Car) -> bool {
-    true
-}
-
-// Forward the registered car information to the registry service asynchronously
-//inputs: car license plate, car URL
-//returns: None
-fn forward_car(license: String, url: String) {
-    tokio::spawn(async move {
-        let body = format!("license={}&url={}", license, url);
-        let client = reqwest::Client::new();
-        let endpoint = format!("{}{}", REGISTRY_HOST, REGISTRY_CAR_REGISTERED);
-        match client.post(&endpoint).body(body).send().await {
-            Ok(_) => {}
-            Err(e) => eprintln!("Failed to forward car to {}: {}", endpoint, e),
-        }
-    });
-}
-
-// Send a command to the car's API endpoint asynchronously
-// inputs: reqwest client, car URL, list of (key, value) parameters to include in the command
-// returns: None
-async fn send_car_command(client: &reqwest::Client, car_url: &str, params: &[(&str, &str)]) {
+async fn send_command(client: &reqwest::Client, car_url: &str, params: &[(&str, &str)]) {
     let body = params
         .iter()
         .map(|(k, v)| format!("{}={}", k, v))
         .collect::<Vec<_>>()
         .join("&");
-
-    let url = format!("{}{}", car_url, CAR_COMMAND);
-    match client
+    let url = format!("{}/command", car_url);
+    if let Err(e) = client
         .post(&url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
         .await
     {
-        Ok(r) => println!("Command to {}: status {}", url, r.status()),
-        Err(e) => eprintln!("Failed to send command to {}: {}", url, e),
+        eprintln!("Command failed to {}: {}", url, e);
     }
 }
 
-// Poll the car's position from its API endpoint asynchronously
-//inputs: reqwest client, car URL
-//returns Some((x, y)) coordinates of the car or None if the poll fails
-async fn get_car_position(client: &reqwest::Client, car_url: &str) -> Option<(f64, f64)> {
-    let url = format!("{}{}", car_url, CAR_POSITION);
+async fn get_position(client: &reqwest::Client, car_url: &str) -> Option<(f64, f64)> {
+    let url = format!("{}/position", car_url);
     let resp = client.get(&url).send().await.ok()?;
     let text = resp.text().await.ok()?;
     let mut x = None;
@@ -122,97 +68,91 @@ async fn get_car_position(client: &reqwest::Client, car_url: &str) -> Option<(f6
     Some((x?, y?))
 }
 
-//drive loop, sending commands to the car to follow the path of waypoints and polling its position to adjust timing
-//inputs: car URL, car license plate, path of waypoints, speed to drive
-//returns: None
 fn start_drive_loop(
     car_url: String,
     license: String,
-    path: Vec<pathfinding::Waypoint>,
+    path: Vec<Waypoint>,
     speed: f64,
+    state: Arc<AppState>,
 ) {
     tokio::spawn(async move {
         let client = reqwest::Client::new();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
         if let Some(first) = path.first() {
-            let speed_str = format!("{:.2}", speed);
-            let dir_x_str = format!("{:.4}", first.dir_x);
-            let dir_y_str = format!("{:.4}", first.dir_y);
-            send_car_command(
+            send_command(
                 &client,
                 &car_url,
                 &[
                     ("type", "set_route"),
                     ("license", &license),
-                    ("speed", &speed_str),
-                    ("direction_x", &dir_x_str),
-                    ("direction_y", &dir_y_str),
+                    ("speed", &format!("{:.2}", speed)),
+                    ("direction_x", &format!("{:.4}", first.dir_x)),
+                    ("direction_y", &format!("{:.4}", first.dir_y)),
+                    ("pos_x", &format!("{:.2}", first.x)),
+                    ("pos_y", &format!("{:.2}", first.y)),
                 ],
             )
             .await;
         }
+
         for i in 0..path.len().saturating_sub(1) {
             let wp = &path[i];
             let next = &path[i + 1];
+
             if speed <= 0.0 || wp.dist_to_next <= 0.0 {
                 continue;
             }
+
             let travel_secs = wp.dist_to_next / speed;
-            let sleep_secs = (travel_secs - POLL_EARLY_SECS).max(0.0);
+            let sleep_secs = (travel_secs - POLL_INTERVAL_SECS).max(0.0);
             tokio::time::sleep(Duration::from_secs_f64(sleep_secs)).await;
-            let near = match get_car_position(&client, &car_url).await {
+
+            let near = match get_position(&client, &car_url).await {
                 Some((cx, cy)) => {
                     let dist = (cx - next.x).hypot(cy - next.y);
-                    println!(
-                        "Car {} position ({:.1}, {:.1}), dist to waypoint {}: {:.1}m",
-                        license,
-                        cx,
-                        cy,
-                        i + 1,
-                        dist
-                    );
-                    dist < WAYPOINT_PROXIMITY
+                    if dist < WAYPOINT_PROXIMITY {
+                        if let Ok(mut map) = state.cars.lock() {
+                            if let Some(c) = map.get_mut(&license) {
+                                c.x = cx;
+                                c.y = cy;
+                            }
+                        }
+                        true
+                    } else {
+                        if let Ok(mut map) = state.cars.lock() {
+                            if let Some(c) = map.get_mut(&license) {
+                                c.x = cx;
+                                c.y = cy;
+                            }
+                        }
+                        false
+                    }
                 }
-                None => {
-                    eprintln!(
-                        "Car {} position poll failed at waypoint {}, proceeding anyway",
-                        license,
-                        i + 1
-                    );
-                    true
-                }
+                None => true,
             };
+
             if !near {
-                tokio::time::sleep(Duration::from_secs_f64(POLL_EARLY_SECS)).await;
+                tokio::time::sleep(Duration::from_secs_f64(POLL_INTERVAL_SECS)).await;
             }
+
             if i + 1 == path.len() - 1 {
+                send_command(&client, &car_url, &[("type", "stop"), ("license", &license)]).await;
                 println!("Car {} reached destination", license);
-                send_car_command(
-                    &client,
-                    &car_url,
-                    &[("type", "stop"), ("license", &license)],
-                )
-                .await;
                 break;
             }
-            let speed_str = format!("{:.2}", speed);
-            let dir_x_str = format!("{:.4}", next.dir_x);
-            let dir_y_str = format!("{:.4}", next.dir_y);
-            println!(
-                "Car {} turning at waypoint {}: dir ({}, {})",
-                license,
-                i + 1,
-                dir_x_str,
-                dir_y_str
-            );
-            send_car_command(
+
+            send_command(
                 &client,
                 &car_url,
                 &[
                     ("type", "set_route"),
                     ("license", &license),
-                    ("speed", &speed_str),
-                    ("direction_x", &dir_x_str),
-                    ("direction_y", &dir_y_str),
+                    ("speed", &format!("{:.2}", speed)),
+                    ("direction_x", &format!("{:.4}", next.dir_x)),
+                    ("direction_y", &format!("{:.4}", next.dir_y)),
+                    ("pos_x", &format!("{:.2}", next.x)),
+                    ("pos_y", &format!("{:.2}", next.y)),
                 ],
             )
             .await;
@@ -220,16 +160,12 @@ fn start_drive_loop(
     });
 }
 
-//endpoint for registering a car with a start and destination
-//inputs: HTTP POST with body containing license, URL, start_x, start_y, dest_x, dest_y
-//returns: HTTP response indicating success or failure of registration and pathfinding
 async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResponse {
     let mut license = String::new();
     let mut url = String::new();
-    let mut start_x = 0.0;
-    let mut start_y = 0.0;
-    let mut dest_x = 0.0;
-    let mut dest_y = 0.0;
+    let mut from_lot = String::new();
+    let mut to_lot = String::new();
+
     for pair in body.split('&') {
         let mut kv = pair.splitn(2, '=');
         let key = kv.next().unwrap_or("");
@@ -237,108 +173,157 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
         match key {
             "license" => license = val.to_string(),
             "url" => url = val.to_string(),
-            "start_x" => start_x = val.parse().unwrap_or(0.0),
-            "start_y" => start_y = val.parse().unwrap_or(0.0),
-            "dest_x" => dest_x = val.parse().unwrap_or(0.0),
-            "dest_y" => dest_y = val.parse().unwrap_or(0.0),
+            "from" => from_lot = val.to_string(),
+            "to" => to_lot = val.to_string(),
             _ => {}
         }
     }
-    let start = Point {
+
+    if license.is_empty() || url.is_empty() || from_lot.is_empty() || to_lot.is_empty() {
+        return HttpResponse::BadRequest()
+            .content_type("text/plain")
+            .body("Missing license, url, from, or to");
+    }
+
+    let (start_x, start_y) = match state.parking_spawns.get(&from_lot) {
+        Some(cfg) => (cfg.spawn[0], cfg.spawn[1]),
+        None => {
+            return HttpResponse::BadRequest()
+                .content_type("text/plain")
+                .body(format!("Unknown parking lot: {}", from_lot));
+        }
+    };
+
+    let (dest_x, dest_y) = match state.parking_spawns.get(&to_lot) {
+        Some(cfg) => (cfg.spawn[0], cfg.spawn[1]),
+        None => {
+            return HttpResponse::BadRequest()
+                .content_type("text/plain")
+                .body(format!("Unknown parking lot: {}", to_lot));
+        }
+    };
+
+    let path = match compute_path(&state.city_graph, start_x, start_y, dest_x, dest_y) {
+        Some(p) => p,
+        None => {
+            return HttpResponse::BadRequest()
+                .content_type("text/plain")
+                .body(format!("No path from {} to {}", from_lot, to_lot));
+        }
+    };
+
+    let car = CarState {
+        license: license.clone(),
+        url: url.clone(),
         x: start_x,
         y: start_y,
     };
-    let dest = Point {
-        x: dest_x,
-        y: dest_y,
-    };
-    let path = match compute_path(&state.city_graph, &start, &dest) {
-        Some(p) => p,
-        None => {
-            eprintln!(
-                "No path found for car {} from ({}, {}) to ({}, {})",
-                license, start_x, start_y, dest_x, dest_y
-            );
-            return HttpResponse::BadRequest()
-                .content_type("text/plain")
-                .body(format!("No path found for car {}", license));
-        }
-    };
-    println!(
-        "Car {}: path computed with {} waypoints",
-        license,
-        path.len()
+    state.cars.lock().unwrap().insert(license.clone(), car);
+
+    start_drive_loop(
+        url.clone(),
+        license.clone(),
+        path,
+        DEFAULT_SPEED,
+        Arc::clone(state.get_ref()),
     );
-    let speed = DEFAULT_SPEED; //make this more smart later
-    let car = Car {
-        license: license.clone(),
-        url: url.clone(),
-        dest,
-    };
-    println!(
-        "Car registered: {} url={} ({:.2}, {:.2}) -> ({:.2}, {:.2})",
-        car.license, car.url, start_x, start_y, car.dest.x, car.dest.y
-    );
-    if !validate_enter_roadway(&car) {
-        println!("Car {} denied entry to roadway", car.license);
-        return HttpResponse::Forbidden()
-            .content_type("text/plain")
-            .body(format!("status=denied&reason=Car {} not allowed to enter roadway", license));
-    }
-    state.cars.lock().unwrap().push(car.clone());
-    println!("Car {} approved, starting drive loop", car.license);
-    start_drive_loop(url.clone(), license.clone(), path, speed);
-    forward_car(license.clone(), url.clone());
+
+    println!("Car {} registered: {} -> {}", license, from_lot, to_lot);
     HttpResponse::Ok()
         .content_type("text/plain")
         .body(format!("status=approved&license={}&url={}", license, url))
 }
 
-//endpoint for getting the total count of registered cars
-//inputs: HTTP GET request
-//returns: HTTP response with the total number of registered cars
-async fn car_count(state: web::Data<Arc<AppState>>) -> HttpResponse {
-    let count = state.cars.lock().unwrap().len();
+async fn car_positions(state: web::Data<Arc<AppState>>) -> HttpResponse {
+    let cars_list: Vec<(String, String)> = {
+        let cars = state.cars.lock().unwrap();
+        cars.iter()
+            .map(|(license, c)| (license.clone(), c.url.clone()))
+            .collect()
+    };
+
+    let client = reqwest::Client::new();
+    let mut out: Vec<String> = Vec::new();
+    let mut updates: Vec<(String, f64, f64)> = Vec::new();
+    for (license, url) in &cars_list {
+        match get_position(&client, url).await {
+            Some((cx, cy)) => {
+                out.push(format!("{}: x={:.2} y={:.2}", license, cx, cy));
+                updates.push((license.clone(), cx, cy));
+            }
+            None => {
+                if let Ok(cars) = state.cars.lock() {
+                    if let Some(c) = cars.get(license) {
+                        out.push(format!("{}: x={:.2} y={:.2} (unreachable)", license, c.x, c.y));
+                    }
+                }
+            }
+        }
+    }
+    if !updates.is_empty() {
+        if let Ok(mut map) = state.cars.lock() {
+            for (license, cx, cy) in updates {
+                if let Some(c) = map.get_mut(&license) {
+                    c.x = cx;
+                    c.y = cy;
+                }
+            }
+        }
+    }
     HttpResponse::Ok()
         .content_type("text/plain")
-        .body(format!("Total cars registered: {}", count))
+        .body(out.join("\n"))
 }
 
-//endpoint for health check
-//inputs: HTTP GET request
-//returns: HTTP response indicating server is healthy
+async fn parking_lots(state: web::Data<Arc<AppState>>) -> HttpResponse {
+    let body: Vec<String> = state
+        .parking_spawns
+        .iter()
+        .map(|(id, cfg)| {
+            format!(
+                "{}: center=({:.1},{:.1}) exit=({:.1},{:.1})",
+                id, cfg.spawn[0], cfg.spawn[1], cfg.exit[0], cfg.exit[1]
+            )
+        })
+        .collect();
+    HttpResponse::Ok()
+        .content_type("text/plain")
+        .body(body.join("\n"))
+}
+
 async fn health() -> HttpResponse {
     HttpResponse::Ok().content_type("text/plain").body("OK")
 }
 
-//main server loop, run each of the endpoints
-//inputs: None
-//returns: Unknown server errors
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let city_map = CityMap::load(CITY_MAP_PATH).unwrap_or_else(|e| {
-        eprintln!("Error loading city map: {}", e);
+        eprintln!("Error loading city: {}", e);
         std::process::exit(1);
     });
-    println!("City map loaded: {} segments", city_map.segment_count());
     let city_graph = city_map.build_graph();
     println!(
-        "City graph built: {} nodes, {} edges",
+        "City loaded: {} nodes, {} edges, {} parking lots",
         city_graph.nodes.len(),
-        city_graph.edges.len()
+        city_graph.edges.len(),
+        city_map.parking_spawns.len()
     );
+
     let state = Arc::new(AppState {
-        cars: Mutex::new(Vec::new()),
+        cars: Mutex::new(HashMap::new()),
         city_graph,
+        parking_spawns: city_map.parking_spawns,
     });
+
     println!("Server running on http://{}", BIND_ADDR);
     HttpServer::new(move || {
         let state = web::Data::new(Arc::clone(&state));
         App::new()
             .app_data(state)
-            .route(ENDPOINT_REGISTER_CAR, web::post().to(register_car))
-            .route(ENDPOINT_HEALTH, web::get().to(health))
-            .route(ENDPOINT_CAR_COUNT, web::get().to(car_count))
+            .route("/register-car", web::post().to(register_car))
+            .route("/car-positions", web::get().to(car_positions))
+            .route("/parking-lots", web::get().to(parking_lots))
+            .route("/health", web::get().to(health))
     })
     .bind(BIND_ADDR)?
     .run()

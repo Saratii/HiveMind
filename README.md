@@ -1,71 +1,79 @@
-# Server Testing
-bin\server.exe
-curl http://localhost:8080
-powershell: Invoke-WebRequest -Method POST -Uri "http://localhost:8080/register-car" -Body "license=ABC123&start_x=0&start_y=0&dest_x=10&dest_y=20"
+# HiveMind
 
-# Installation
-vcpkg install libuv:x64-windows
-vcpkg install raylib:x64-windows
+Simple car simulation: cars register with the server, get paths between 3 parking lots, traverse roads, and report x,y coordinates.
 
-# Map Generation
+## Quick Start
 
-bin\city_map.exe generate 12345
-bin\city_map.exe export 12345 hive_mind_server/city.json
-bin\city_map.exe load hive_mind_server/city.json
+### 1. Start the server
 
-All coordinates are expressed in meters.
-Each [x, y] value represents a position in world space measured in meters.
-City is centered at 0, 0
-
-The origin (0,0) is arbitrary but must be shared between the simulation server and renderer.
-1 unit = 1 meter
-
-City Map JSON Format
-
-{
-  "segments": [
-    {
-      "id": 1,
-      "pts": [
-        [0.0, 0.0],
-        [50.0, 0.0],
-        [50.0, 20.0]
-      ]
-    }
-  ]
-}
-
-segments: array of road segments  
-id: integer segment identifier  
-pts: array of [x, y] world-space points
-
-```.vscode/c_cpp_properties.json
-{
-    "configurations": [
-        {
-            "name": "Win32",
-            "includePath": [
-                "${workspaceFolder}/**",
-                "C:/vcpkg/installed/x64-windows/include"
-            ],
-            "defines": [],
-            "compilerPath": "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/*/bin/Hostx64/x64/cl.exe",
-            "cStandard": "c17",
-            "cppStandard": "c++17",
-            "intelliSenseMode": "windows-msvc-x64"
-        },
-        {
-            "name": "MinGW-GCC",
-            "includePath": [
-                "${workspaceFolder}/**",
-                "C:/vcpkg/installed/x64-windows/include"
-            ],
-            "defines": [],
-            "compilerPath": "C:/msys64/mingw64/bin/gcc.exe",
-            "cStandard": "c11",
-            "intelliSenseMode": "windows-gcc-x64"
-        }
-    ],
-    "version": 4
-}
+```powershell
+cd hive_mind_server
+cargo run
 ```
+
+Server runs on http://0.0.0.0:8080 and loads `../city.json`.
+
+### 2. Spawn 3 cars
+
+In a new terminal:
+
+```powershell
+.\spawn-cars.ps1
+```
+
+This starts:
+- CAR001: lot A → B (port 9001)
+- CAR002: lot B → C (port 9002)
+- CAR003: lot C → A (port 9003)
+
+### 3. Query positions
+
+```powershell
+.\query-positions.ps1
+```
+
+Polls `/car-positions` every 2 seconds and displays x,y for each car.
+
+Or manually:
+
+```powershell
+Invoke-WebRequest http://localhost:8080/car-positions
+```
+
+## Spawn a single car
+
+```powershell
+python car/car.py CAR001 9001 A B
+#           license port  from to
+```
+
+## Check lot coordinates
+
+```powershell
+.\check-lots.ps1
+```
+
+Fetches `/parking-lots` and displays center and exit coords for A, B, C.
+
+## Endpoints
+
+| Endpoint       | Method | Description                    |
+|----------------|--------|--------------------------------|
+| /register-car  | POST   | license, url, from, to         |
+| /car-positions | GET    | Live poll of all cars' x,y     |
+| /parking-lots  | GET    | Lot centers and exits          |
+| /health        | GET    | Health check                   |
+
+## Visualization
+
+```powershell
+pip install pygame
+python viz.py
+```
+
+Opens a Pygame window showing roads, parking lots (A, B, C), and car positions. Polls the server every second. Resizable window.
+
+## city.json
+
+- `segments`: road line segments `[[x1,y1], [x2,y2], ...]`
+- `parking_lots`: A, B, C with `center` (spawn) and `exit` (road connection)

@@ -130,6 +130,21 @@ def kill_processes_on_ports(ports):
             pass
     time.sleep(1.0)
 
+def reset_cars_to_start():
+    """Ask server to reset all cars to start and restart their routes."""
+    req = urllib.request.Request(
+        f"{SERVER_URL}/reset-car",
+        data=b"",
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=3)
+        print("Reset: cars restarted at start.", flush=True)
+    except Exception as e:
+        print(f"Reset failed: {e}", flush=True)
+
+
 def spawn_cars():
     """Spawn 2 cars in background: one A->B, one B->A."""
     kill_processes_on_ports([9001, 9002])
@@ -153,7 +168,7 @@ def spawn_cars():
     return procs
 
 
-def run_viz():
+def run_viz(procs):
     city = load_city()
     x_min, x_max, y_min, y_max = world_bounds(city)
     w, h = WINDOW_SIZE
@@ -167,6 +182,9 @@ def run_viz():
     cars = []
     error_msg = None
 
+    def get_reset_rect():
+        return pygame.Rect(w - 110, h - 38, 90, 26)
+
     running = True
     while running:
         for event in pygame.event.get():
@@ -175,6 +193,9 @@ def run_viz():
             elif event.type == pygame.VIDEORESIZE:
                 w, h = event.w, event.h
                 screen = pygame.display.set_mode((w, h), pygame.RESIZABLE)
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if get_reset_rect().collidepoint(event.pos):
+                    reset_cars_to_start()
 
         now = pygame.time.get_ticks()
         if now - last_poll > POLL_INTERVAL_MS:
@@ -228,6 +249,13 @@ def run_viz():
         text = font.render(status, True, TEXT_COLOR)
         screen.blit(text, (10, h - 32))
 
+        # Reset button
+        reset_rect = get_reset_rect()
+        pygame.draw.rect(screen, (70, 100, 160), reset_rect)
+        pygame.draw.rect(screen, (120, 150, 220), reset_rect, 2)
+        reset_label = font.render("Reset", True, (255, 255, 255))
+        screen.blit(reset_label, (reset_rect.x + (reset_rect.w - reset_label.get_width()) // 2, reset_rect.y + 4))
+
         pygame.display.flip()
         clock.tick(30)
 
@@ -251,7 +279,7 @@ def main():
     time.sleep(1)
 
     try:
-        run_viz()
+        run_viz(procs)
     finally:
         for p in procs:
             try:

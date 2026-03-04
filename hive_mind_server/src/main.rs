@@ -27,8 +27,10 @@ struct CarState {
     y: f64,
 }
 
+/// Stored per car so we can restart the drive loop on reset: (url, path, start_x, start_y).
 struct AppState {
     cars: Mutex<HashMap<String, CarState>>,
+    registered_routes: Mutex<HashMap<String, (String, Vec<Waypoint>, f64, f64)>>,
     city_graph: CityGraph,
     parking_spawns: ParkingLotSpawns,
 }
@@ -239,6 +241,11 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
         y: start_y,
     };
     state.cars.lock().unwrap().insert(license.clone(), car);
+    state
+        .registered_routes
+        .lock()
+        .unwrap()
+        .insert(license.clone(), (url.clone(), path.clone(), start_x, start_y));
 
     start_drive_loop(
         url.clone(),
@@ -317,6 +324,49 @@ async fn health() -> HttpResponse {
     HttpResponse::Ok().content_type("text/plain").body("OK")
 }
 
+async fn reset_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResponse {
+    let licenses: Vec<String> = if body.is_empty() {
+        state
+            .registered_routes
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    } else {
+        body.split('&')
+            .filter_map(|p| {
+                let mut kv = p.splitn(2, '=');
+                let k = kv.next()?.trim();
+                let v = kv.next()?.trim();
+                if k == "license" && !v.is_empty() {
+                    Some(v.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let routes = state.registered_routes.lock().unwrap();
+    for license in licenses {
+        if let Some((ref url, ref path, start_x, start_y)) = routes.get(&license) {
+            start_drive_loop(
+                url.clone(),
+                license.clone(),
+                path.clone(),
+                DEFAULT_SPEED,
+                *start_x,
+                *start_y,
+                Arc::clone(state.get_ref()),
+            );
+            println!("Car {} reset to start", license);
+        }
+    }
+    HttpResponse::Ok()
+        .content_type("text/plain")
+        .body("ok")
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let city_map = CityMap::load(CITY_MAP_PATH).unwrap_or_else(|e| {
@@ -333,6 +383,7 @@ async fn main() -> std::io::Result<()> {
 
     let state = Arc::new(AppState {
         cars: Mutex::new(HashMap::new()),
+        registered_routes: Mutex::new(HashMap::new()),
         city_graph,
         parking_spawns: city_map.parking_spawns,
     });
@@ -346,6 +397,7 @@ async fn main() -> std::io::Result<()> {
             .route("/car-positions", web::get().to(car_positions))
             .route("/parking-lots", web::get().to(parking_lots))
             .route("/health", web::get().to(health))
+            .route("/reset-car", web::post().to(reset_car))
     })
     .bind(BIND_ADDR)?
     .run()

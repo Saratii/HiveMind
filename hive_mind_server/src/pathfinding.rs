@@ -98,7 +98,7 @@ pub fn compute_path(
         return None;
     }
 
-    const STEP_M: f64 = 40.0;
+    const STEP_M: f64 = 20.0;
     let mut waypoints = Vec::new();
     for i in 0..node_path.len() - 1 {
         let a = &graph.nodes[node_path[i]];

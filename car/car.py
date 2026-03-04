@@ -22,6 +22,10 @@ speed = 0.0
 license = "CAR001"
 run = True
 
+# Reject position updates outside map (never warp car off roads)
+MAP_X_MIN, MAP_X_MAX = -500, 1500
+MAP_Y_MIN, MAP_Y_MAX = -600, 600
+
 
 def sim_loop():
     """Update position every 50ms based on speed and direction."""
@@ -74,8 +78,10 @@ class CarHandler(BaseHTTPRequestHandler):
                         dir_x = dx / mag
                         dir_y = dy / mag
                     if "pos_x" in params and "pos_y" in params:
-                        x = float(get("pos_x", str(x)))
-                        y = float(get("pos_y", str(y)))
+                        px = float(get("pos_x", str(x)))
+                        py = float(get("pos_y", str(y)))
+                        if MAP_X_MIN <= px <= MAP_X_MAX and MAP_Y_MIN <= py <= MAP_Y_MAX:
+                            x, y = px, py
                 except ValueError:
                     pass
 
@@ -125,7 +131,7 @@ def main():
     lot_centers = {
         "A": (900, -500),
         "B": (-300, 500),
-        "C": (150, -250),
+        "C": (200, -220),
     }
     x, y = lot_centers.get(args.from_lot, (0, 0))
     # Keep speed=0 until server sends first command (avoids wrong initial direction)

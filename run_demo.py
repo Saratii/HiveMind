@@ -55,7 +55,7 @@ def world_bounds(city):
         return -100, 100, -100, 100
     xs = [p[0] for p in all_pts]
     ys = [p[1] for p in all_pts]
-    pad = 100
+    pad = 150
     return min(xs) - pad, max(xs) + pad, min(ys) - pad, max(ys) + pad
 
 
@@ -100,20 +100,57 @@ def wait_for_server(timeout=5):
     return False
 
 
-def spawn_car():
-    """Spawn one car (CAR001 A->B) in background, no window so it stays running."""
-    cmd = [sys.executable, str(CAR_SCRIPT), "CAR001", "9001", "A", "B"]
-    flags = 0
-    if sys.platform == "win32":
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-    p = subprocess.Popen(
-        cmd,
-        cwd=ROOT,
-        creationflags=flags,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    return [p]
+def kill_processes_on_ports(ports):
+    """Kill any process listening on the given ports (Windows: netstat + taskkill)."""
+    if sys.platform != "win32":
+        return
+    for port in ports:
+        try:
+            out = subprocess.run(
+                ["netstat", "-ano"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW if getattr(subprocess, "CREATE_NO_WINDOW", None) else 0,
+            )
+            for line in (out.stdout or "").splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    parts = line.split()
+                    if parts:
+                        pid = parts[-1]
+                        if pid.isdigit():
+                            subprocess.run(
+                                ["taskkill", "/F", "/PID", pid],
+                                capture_output=True,
+                                timeout=5,
+                                creationflags=subprocess.CREATE_NO_WINDOW if getattr(subprocess, "CREATE_NO_WINDOW", None) else 0,
+                            )
+                            break
+        except Exception:
+            pass
+    time.sleep(1.0)
+
+def spawn_cars():
+    """Spawn 2 cars in background: one A->B, one B->A."""
+    kill_processes_on_ports([9001, 9002])
+    cars = [
+        ("CAR001", 9001, "A", "B"),
+        ("CAR002", 9002, "B", "A"),
+    ]
+    procs = []
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platform == "win32" else 0
+    for license_id, port, from_lot, to_lot in cars:
+        cmd = [sys.executable, str(CAR_SCRIPT), license_id, str(port), from_lot, to_lot]
+        p = subprocess.Popen(
+            cmd,
+            cwd=ROOT,
+            creationflags=flags,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        procs.append(p)
+        time.sleep(2.0)
+    return procs
 
 
 def run_viz():
@@ -205,9 +242,9 @@ def main():
         print("  cd hive_mind_server")
         print("  cargo run")
         sys.exit(1)
-    print("Server OK. Spawning 1 car (CAR001 A->B)...")
+    print("Server OK. Spawning 2 cars (CAR001 A->B, CAR002 B->A)...")
 
-    procs = spawn_car()
+    procs = spawn_cars()
     time.sleep(2.5)
     print("Car spawned. Starting visualization. Coordinate updates below:\n")
 

@@ -15,6 +15,8 @@ const DEFAULT_SPEED: f64 = 75.0;
 const CITY_MAP_PATH: &str = "../city.json";
 const BIND_ADDR: &str = "0.0.0.0:8080";
 const WAYPOINT_PROXIMITY: f64 = 30.0;
+/// Min distance the car must have moved from current waypoint before we consider it "near" the next (avoids instant advance).
+const MIN_PROGRESS_FROM_WP: f64 = 15.0;
 const POLL_INTERVAL_SECS: f64 = 0.5;
 
 #[derive(Clone)]
@@ -73,13 +75,24 @@ fn start_drive_loop(
     license: String,
     path: Vec<Waypoint>,
     speed: f64,
+    start_x: f64,
+    start_y: f64,
     state: Arc<AppState>,
 ) {
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         tokio::time::sleep(Duration::from_millis(300)).await;
 
+        // First command: spawn car at its lot coords (start_x, start_y), direction toward first waypoint
         if let Some(first) = path.first() {
+            let dx = first.x - start_x;
+            let dy = first.y - start_y;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let (dir_x, dir_y) = if dist > 1e-9 {
+                (dx / dist, dy / dist)
+            } else {
+                (first.dir_x, first.dir_y)
+            };
             send_command(
                 &client,
                 &car_url,
@@ -87,10 +100,10 @@ fn start_drive_loop(
                     ("type", "set_route"),
                     ("license", &license),
                     ("speed", &format!("{:.2}", speed)),
-                    ("direction_x", &format!("{:.4}", first.dir_x)),
-                    ("direction_y", &format!("{:.4}", first.dir_y)),
-                    ("pos_x", &format!("{:.2}", first.x)),
-                    ("pos_y", &format!("{:.2}", first.y)),
+                    ("direction_x", &format!("{:.4}", dir_x)),
+                    ("direction_y", &format!("{:.4}", dir_y)),
+                    ("pos_x", &format!("{:.2}", start_x)),
+                    ("pos_y", &format!("{:.2}", start_y)),
                 ],
             )
             .await;
@@ -99,6 +112,12 @@ fn start_drive_loop(
         for i in 0..path.len().saturating_sub(1) {
             let wp = &path[i];
             let next = &path[i + 1];
+            let (prev_x, prev_y) = if i == 0 {
+                (start_x, start_y)
+            } else {
+                (path[i - 1].x, path[i - 1].y)
+            };
+            let is_last_segment = i + 1 == path.len() - 1;
 
             if speed <= 0.0 || wp.dist_to_next <= 0.0 {
                 continue;
@@ -108,40 +127,43 @@ fn start_drive_loop(
             let sleep_secs = (travel_secs - POLL_INTERVAL_SECS).max(0.0);
             tokio::time::sleep(Duration::from_secs_f64(sleep_secs)).await;
 
-            let near = match get_position(&client, &car_url).await {
-                Some((cx, cy)) => {
-                    let dist = (cx - next.x).hypot(cy - next.y);
-                    if dist < WAYPOINT_PROXIMITY {
+            // Wait until car is near target: for last segment wait for destination (next), else wait for wp
+            let target_x = if is_last_segment { next.x } else { wp.x };
+            let target_y = if is_last_segment { next.y } else { wp.y };
+            let _reached = loop {
+                match get_position(&client, &car_url).await {
+                    Some((cx, cy)) => {
+                        let dist_to_target = (cx - target_x).hypot(cy - target_y);
+                        let dist_from_prev = (cx - prev_x).hypot(cy - prev_y);
+                        let seg_dx = target_x - prev_x;
+                        let seg_dy = target_y - prev_y;
+                        let seg_len_sq = seg_dx * seg_dx + seg_dy * seg_dy;
+                        let overshot = seg_len_sq > 1e-9
+                            && (cx - prev_x) * seg_dx + (cy - prev_y) * seg_dy >= seg_len_sq;
+                        let made_progress = dist_from_prev >= MIN_PROGRESS_FROM_WP || overshot;
+                        let is_near = (dist_to_target < WAYPOINT_PROXIMITY || overshot) && made_progress;
                         if let Ok(mut map) = state.cars.lock() {
                             if let Some(c) = map.get_mut(&license) {
                                 c.x = cx;
                                 c.y = cy;
                             }
                         }
-                        true
-                    } else {
-                        if let Ok(mut map) = state.cars.lock() {
-                            if let Some(c) = map.get_mut(&license) {
-                                c.x = cx;
-                                c.y = cy;
-                            }
+                        if is_near {
+                            break;
                         }
-                        false
                     }
+                    None => {}
                 }
-                None => true,
+                tokio::time::sleep(Duration::from_secs_f64(POLL_INTERVAL_SECS)).await;
             };
 
-            if !near {
-                tokio::time::sleep(Duration::from_secs_f64(POLL_INTERVAL_SECS)).await;
-            }
-
-            if i + 1 == path.len() - 1 {
+            if is_last_segment {
                 send_command(&client, &car_url, &[("type", "stop"), ("license", &license)]).await;
                 println!("Car {} reached destination", license);
                 break;
             }
 
+            // Send direction from this wp toward next waypoint
             send_command(
                 &client,
                 &car_url,
@@ -149,10 +171,8 @@ fn start_drive_loop(
                     ("type", "set_route"),
                     ("license", &license),
                     ("speed", &format!("{:.2}", speed)),
-                    ("direction_x", &format!("{:.4}", next.dir_x)),
-                    ("direction_y", &format!("{:.4}", next.dir_y)),
-                    ("pos_x", &format!("{:.2}", next.x)),
-                    ("pos_y", &format!("{:.2}", next.y)),
+                    ("direction_x", &format!("{:.4}", wp.dir_x)),
+                    ("direction_y", &format!("{:.4}", wp.dir_y)),
                 ],
             )
             .await;
@@ -225,6 +245,8 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
         license.clone(),
         path,
         DEFAULT_SPEED,
+        start_x,
+        start_y,
         Arc::clone(state.get_ref()),
     );
 

@@ -14,6 +14,7 @@ use pathfinding::{compute_path, Waypoint};
 const DEFAULT_SPEED: f64 = 75.0;
 const CITY_MAP_PATH: &str = "../city.json";
 const BIND_ADDR: &str = "0.0.0.0:8080";
+const SCENE_PATHS: [&str; 3] = ["../city_scene1.json", "../city_scene2.json", "../city_scene3.json"];
 const WAYPOINT_PROXIMITY: f64 = 30.0;
 /// Min distance the car must have moved from current waypoint before we consider it "near" the next (avoids instant advance).
 const MIN_PROGRESS_FROM_WP: f64 = 15.0;
@@ -28,11 +29,12 @@ struct CarState {
 }
 
 /// Stored per car so we can restart the drive loop on reset: (url, path, start_x, start_y).
+/// city_graph and parking_spawns are in Mutex so we can swap them on scene switch.
 struct AppState {
     cars: Mutex<HashMap<String, CarState>>,
     registered_routes: Mutex<HashMap<String, (String, Vec<Waypoint>, f64, f64)>>,
-    city_graph: CityGraph,
-    parking_spawns: ParkingLotSpawns,
+    city_graph: Mutex<CityGraph>,
+    parking_spawns: Mutex<ParkingLotSpawns>,
 }
 
 async fn send_command(client: &reqwest::Client, car_url: &str, params: &[(&str, &str)]) {
@@ -207,7 +209,7 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
             .body("Missing license, url, from, or to");
     }
 
-    let (start_x, start_y) = match state.parking_spawns.get(&from_lot) {
+    let (start_x, start_y) = match state.parking_spawns.lock().unwrap().get(&from_lot) {
         Some(cfg) => (cfg.spawn[0], cfg.spawn[1]),
         None => {
             return HttpResponse::BadRequest()
@@ -216,7 +218,7 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
         }
     };
 
-    let (dest_x, dest_y) = match state.parking_spawns.get(&to_lot) {
+    let (dest_x, dest_y) = match state.parking_spawns.lock().unwrap().get(&to_lot) {
         Some(cfg) => (cfg.spawn[0], cfg.spawn[1]),
         None => {
             return HttpResponse::BadRequest()
@@ -225,7 +227,7 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
         }
     };
 
-    let path = match compute_path(&state.city_graph, start_x, start_y, dest_x, dest_y) {
+    let path = match compute_path(&state.city_graph.lock().unwrap(), start_x, start_y, dest_x, dest_y) {
         Some(p) => p,
         None => {
             return HttpResponse::BadRequest()
@@ -307,6 +309,8 @@ async fn car_positions(state: web::Data<Arc<AppState>>) -> HttpResponse {
 async fn parking_lots(state: web::Data<Arc<AppState>>) -> HttpResponse {
     let body: Vec<String> = state
         .parking_spawns
+        .lock()
+        .unwrap()
         .iter()
         .map(|(id, cfg)| {
             format!(
@@ -322,6 +326,45 @@ async fn parking_lots(state: web::Data<Arc<AppState>>) -> HttpResponse {
 
 async fn health() -> HttpResponse {
     HttpResponse::Ok().content_type("text/plain").body("OK")
+}
+
+async fn switch_scene(state: web::Data<Arc<AppState>>, body: String) -> HttpResponse {
+    let scene = body
+        .split('&')
+        .find_map(|p| {
+            let mut kv = p.splitn(2, '=');
+            let k = kv.next()?.trim();
+            let v = kv.next()?.trim();
+            if k == "scene" {
+                v.parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .and_then(|n| if (1..=3).contains(&n) { Some(n) } else { None });
+    let Some(scene) = scene else {
+        return HttpResponse::BadRequest()
+            .content_type("text/plain")
+            .body("Missing or invalid scene=1|2|3");
+    };
+    let path = SCENE_PATHS[scene - 1];
+    let city_map = match CityMap::load(path) {
+        Ok(m) => m,
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+                .content_type("text/plain")
+                .body(format!("Failed to load {}: {}", path, e));
+        }
+    };
+    let graph = city_map.build_graph();
+    state.cars.lock().unwrap().clear();
+    state.registered_routes.lock().unwrap().clear();
+    *state.city_graph.lock().unwrap() = graph;
+    *state.parking_spawns.lock().unwrap() = city_map.parking_spawns;
+    println!("Switched to scene {}", scene);
+    HttpResponse::Ok()
+        .content_type("text/plain")
+        .body(format!("ok scene={}", scene))
 }
 
 async fn reset_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResponse {
@@ -384,8 +427,8 @@ async fn main() -> std::io::Result<()> {
     let state = Arc::new(AppState {
         cars: Mutex::new(HashMap::new()),
         registered_routes: Mutex::new(HashMap::new()),
-        city_graph,
-        parking_spawns: city_map.parking_spawns,
+        city_graph: Mutex::new(city_graph),
+        parking_spawns: Mutex::new(city_map.parking_spawns),
     });
 
     println!("Server running on http://{}", BIND_ADDR);
@@ -397,6 +440,7 @@ async fn main() -> std::io::Result<()> {
             .route("/car-positions", web::get().to(car_positions))
             .route("/parking-lots", web::get().to(parking_lots))
             .route("/health", web::get().to(health))
+            .route("/switch-scene", web::post().to(switch_scene))
             .route("/reset-car", web::post().to(reset_car))
     })
     .bind(BIND_ADDR)?

@@ -21,26 +21,37 @@ except ImportError:
 # Paths
 ROOT = Path(__file__).resolve().parent
 CITY_JSON = ROOT / "city.json"
+SCENE_JSON = [ROOT / "city_scene1.json", ROOT / "city_scene2.json", ROOT / "city_scene3.json"]
 CAR_SCRIPT = ROOT / "car" / "car.py"
 SERVER_URL = "http://127.0.0.1:8080"
+
+# Scene 1: 1 car A->B. Scene 2: 2 cars both to C. Scene 3: 2 cars A<->B. (license, port, from_lot, to_lot)
+SCENE_CARS = [
+    [("CAR001", 9001, "A", "B")],
+    [("CAR001", 9001, "A", "C"), ("CAR002", 9002, "B", "C")],
+    [("CAR001", 9001, "A", "B"), ("CAR002", 9002, "B", "A")],
+]
 
 # Viz config
 POLL_INTERVAL_MS = 500
 WINDOW_SIZE = (900, 600)
 MARGIN = 60
+MARGIN_LEFT = 125
 ROAD_COLOR = (80, 80, 80)
 ROAD_WIDTH = 10
 LOT_COLOR = (100, 140, 180)
 LOT_RADIUS = 30
-CAR_COLORS = [(220, 60, 60), (60, 180, 80)]
+CAR_COLORS = [(220, 60, 60), (60, 180, 80), (80, 120, 220)]
 CAR_RADIUS = 14
 BG_COLOR = (30, 35, 45)
 TEXT_COLOR = (200, 200, 200)
 GRID_COLOR = (50, 55, 65)
 
 
-def load_city():
-    with open(CITY_JSON) as f:
+def load_city(scene=1):
+    """Load city JSON for the given scene (1, 2, or 3)."""
+    path = SCENE_JSON[scene - 1] if 1 <= scene <= 3 else CITY_JSON
+    with open(path) as f:
         return json.load(f)
 
 
@@ -63,7 +74,7 @@ def to_screen(x, y, x_min, x_max, y_min, y_max, w, h):
     if x_max == x_min:
         sx = w // 2
     else:
-        sx = MARGIN + (x - x_min) / (x_max - x_min) * (w - 2 * MARGIN)
+        sx = MARGIN_LEFT + (x - x_min) / (x_max - x_min) * (w - MARGIN_LEFT - MARGIN)
     if y_max == y_min:
         sy = h // 2
     else:
@@ -145,13 +156,26 @@ def reset_cars_to_start():
         print(f"Reset failed: {e}", flush=True)
 
 
-def spawn_cars():
-    """Spawn 2 cars in background: one A->B, one B->A."""
-    kill_processes_on_ports([9001, 9002])
-    cars = [
-        ("CAR001", 9001, "A", "B"),
-        ("CAR002", 9002, "B", "A"),
-    ]
+def switch_scene(scene: int):
+    """Tell server to load the given scene map (1, 2, or 3)."""
+    data = f"scene={scene}".encode()
+    req = urllib.request.Request(
+        f"{SERVER_URL}/switch-scene",
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=3)
+    except Exception as e:
+        print(f"Switch scene failed: {e}", flush=True)
+
+
+def spawn_cars(scene=1):
+    """Spawn cars for the given scene (1, 2, or 3)."""
+    cars = SCENE_CARS[scene - 1] if 1 <= scene <= 3 else SCENE_CARS[0]
+    ports = [c[1] for c in cars]
+    kill_processes_on_ports(ports)
     procs = []
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platform == "win32" else 0
     for license_id, port, from_lot, to_lot in cars:
@@ -168,11 +192,15 @@ def spawn_cars():
     return procs
 
 
-def run_viz(procs):
-    city = load_city()
-    x_min, x_max, y_min, y_max = world_bounds(city)
-    w, h = WINDOW_SIZE
+# Left-side scene buttons: x, y, width, height (wide enough for "A to B to A")
+SCENE_BTN_X, SCENE_BTN_W, SCENE_BTN_H = 12, 108, 30
+SCENE_BTN_Y_START = 70
+SCENE_BTN_GAP = 6
 
+
+def run_viz(procs, current_scene):
+    """current_scene is a list of one int (1, 2, or 3) so we can mutate it on button click."""
+    w, h = WINDOW_SIZE
     pygame.init()
     screen = pygame.display.set_mode(WINDOW_SIZE, pygame.RESIZABLE)
     pygame.display.set_caption("HiveMind - Road Demo")
@@ -185,8 +213,30 @@ def run_viz(procs):
     def get_reset_rect():
         return pygame.Rect(w - 110, h - 38, 90, 26)
 
+    def get_scene_rect(n):
+        return pygame.Rect(SCENE_BTN_X, SCENE_BTN_Y_START + (n - 1) * (SCENE_BTN_H + SCENE_BTN_GAP), SCENE_BTN_W, SCENE_BTN_H)
+
+    def apply_scene(n):
+        if n == current_scene[0]:
+            return
+        switch_scene(n)
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        time.sleep(1.0)
+        procs[:] = spawn_cars(n)
+        current_scene[0] = n
+        time.sleep(2.0)
+        print(f"Scene {n}: {' '.join(f'{c[0]} {c[2]}->{c[3]}' for c in SCENE_CARS[n - 1])}", flush=True)
+
     running = True
     while running:
+        scene_num = current_scene[0]
+        city = load_city(scene_num)
+        x_min, x_max, y_min, y_max = world_bounds(city)
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -196,6 +246,10 @@ def run_viz(procs):
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if get_reset_rect().collidepoint(event.pos):
                     reset_cars_to_start()
+                for n in (1, 2, 3):
+                    if get_scene_rect(n).collidepoint(event.pos):
+                        apply_scene(n)
+                        break
 
         now = pygame.time.get_ticks()
         if now - last_poll > POLL_INTERVAL_MS:
@@ -243,11 +297,23 @@ def run_viz(procs):
             label = font.render(license_id, True, color)
             screen.blit(label, (sx - label.get_width() // 2, sy - CAR_RADIUS - 18))
 
-        status = f"Cars: {len(cars)}  |  Roads from city.json  |  {SERVER_URL}"
+        status = f"Cars: {len(cars)}  |  Scene {scene_num}  |  {SERVER_URL}"
         if error_msg:
             status = f"Server error: {error_msg}"
         text = font.render(status, True, TEXT_COLOR)
         screen.blit(text, (10, h - 32))
+
+        # Scene buttons (left side)
+        scene_labels = ["Scene 1", "Scene 2", "Scene 3"]
+        for n in (1, 2, 3):
+            r = get_scene_rect(n)
+            is_active = n == scene_num
+            color = (90, 130, 180) if is_active else (60, 70, 85)
+            border = (140, 180, 220) if is_active else (80, 90, 100)
+            pygame.draw.rect(screen, color, r)
+            pygame.draw.rect(screen, border, r, 2)
+            lbl = font.render(scene_labels[n - 1], True, (255, 255, 255))
+            screen.blit(lbl, (r.x + (r.w - lbl.get_width()) // 2, r.y + 6))
 
         # Reset button
         reset_rect = get_reset_rect()
@@ -270,16 +336,18 @@ def main():
         print("  cd hive_mind_server")
         print("  cargo run")
         sys.exit(1)
-    print("Server OK. Spawning 2 cars (CAR001 A->B, CAR002 B->A)...")
-
-    procs = spawn_cars()
+    # Start on Scene 1 (1 car A->B)
+    switch_scene(1)
+    time.sleep(0.5)
+    print("Server OK. Scene 1: 1 car CAR001 A->B...")
+    procs = spawn_cars(1)
     time.sleep(2.5)
-    print("Car spawned. Starting visualization. Coordinate updates below:\n")
-
+    print("Cars spawned. Scene 1: 1 car | Scene 2: both to C | Scene 3: 2 cars A<->B. Bottom-right: Reset.\n")
     time.sleep(1)
+    current_scene = [1]
 
     try:
-        run_viz(procs)
+        run_viz(procs, current_scene)
     finally:
         for p in procs:
             try:

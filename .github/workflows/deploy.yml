@@ -40,7 +40,7 @@ jobs:
           script: |
             source $HOME/.cargo/env
             cd ~/HiveMind
-            git pull origin main
+            git fetch origin && git reset --hard origin/main
             cd hive_mind_server
             cargo build --release
             sudo systemctl restart hivemind

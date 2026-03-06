@@ -1,0 +1,46 @@
+name: Build & Deploy HiveMind
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            hive_mind_server/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('hive_mind_server/Cargo.lock') }}
+
+      - name: Build
+        run: |
+          cd hive_mind_server
+          cargo build --release
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            source $HOME/.cargo/env
+            cd ~/HiveMind
+            git pull origin main
+            cd hive_mind_server
+            cargo build --release
+            sudo systemctl restart hivemind

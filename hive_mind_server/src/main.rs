@@ -25,11 +25,10 @@ use pathfinding::{compute_path, Waypoint};
 const DEFAULT_SPEED: f64 = 75.0;
 const CITY_MAP_PATH: &str = "../city.json";
 const BIND_ADDR: &str = "0.0.0.0:8080";
-const SCENE_PATHS: [&str; 3] = ["../city_scene1.json", "../city_scene2.json", "../city_scene3.json"];
 const WAYPOINT_PROXIMITY: f64 = 30.0;
-/// Min distance the car must have moved from current waypoint before we consider it "near" the next (avoids instant advance).
 const MIN_PROGRESS_FROM_WP: f64 = 15.0;
 const POLL_INTERVAL_SECS: f64 = 0.5;
+const ENTRANCE_PROXIMITY: f64 = 5.0;
 
 /// Snapshot of a single car as tracked by the server (current URL and last-known position).
 #[derive(Clone)]
@@ -40,13 +39,9 @@ struct CarState {
     y: f64,
 }
 
-/// Application-wide state shared across handlers.
-/// - `cars`: last-known positions for debug/inspection when cars are unreachable.
-/// - `registered_routes`: cached routes so we can restart cars on reset.
-/// - `city_graph` / `parking_spawns`: current scene data, hot-swapped on `/switch-scene`.
 struct AppState {
     cars: Mutex<HashMap<String, CarState>>,
-    registered_routes: Mutex<HashMap<String, (String, Vec<Waypoint>, f64, f64)>>,
+    registered_routes: Mutex<HashMap<String, (String, Vec<Waypoint>, String, String)>>,
     city_graph: Mutex<CityGraph>,
     parking_spawns: Mutex<ParkingLotSpawns>,
 }
@@ -90,8 +85,83 @@ async fn get_position(client: &reqwest::Client, car_url: &str) -> Option<(f64, f
     Some((x?, y?))
 }
 
-/// Drive loop for a single car: sends initial spawn, then advances along the waypoint path
-/// while polling position to decide when to move on to the next segment.
+/// Leave lot (drive to entrance, wait, enter roadway), then drive loop to dest entrance, then go to dest center.
+fn run_car_trip(
+    car_url: String,
+    license: String,
+    path: Vec<Waypoint>,
+    from_lot: String,
+    to_lot: String,
+    state: Arc<AppState>,
+) {
+    let state_clone = Arc::clone(&state);
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let (entrance_from, dest_center_x, dest_center_y) = {
+            let spawns = state_clone.parking_spawns.lock().unwrap();
+            let from_cfg = spawns.get(&from_lot).expect("from_lot");
+            let to_cfg = spawns.get(&to_lot).expect("to_lot");
+            (
+                (from_cfg.entrance[0], from_cfg.entrance[1]),
+                to_cfg.spawn[0],
+                to_cfg.spawn[1],
+            )
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        send_command(
+            &client,
+            &car_url,
+            &[
+                ("type", "drive_to_entrance"),
+                ("entrance_x", &format!("{:.2}", entrance_from.0)),
+                ("entrance_y", &format!("{:.2}", entrance_from.1)),
+            ],
+        )
+        .await;
+
+        loop {
+            tokio::time::sleep(Duration::from_secs_f64(POLL_INTERVAL_SECS)).await;
+            if let Some((cx, cy)) = get_position(&client, &car_url).await {
+                if (cx - entrance_from.0).hypot(cy - entrance_from.1) <= ENTRANCE_PROXIMITY {
+                    break;
+                }
+            }
+        }
+
+        send_command(
+            &client,
+            &car_url,
+            &[
+                ("type", "enter_roadway"),
+                ("road_x", &format!("{:.2}", entrance_from.0)),
+                ("road_y", &format!("{:.2}", entrance_from.1)),
+            ],
+        )
+        .await;
+
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if let Some((cx, cy)) = get_position(&client, &car_url).await {
+                if (cx - entrance_from.0).hypot(cy - entrance_from.1) <= ENTRANCE_PROXIMITY {
+                    break;
+                }
+            }
+        }
+
+        start_drive_loop(
+            car_url,
+            license,
+            path,
+            DEFAULT_SPEED,
+            entrance_from.0,
+            entrance_from.1,
+            Some((dest_center_x, dest_center_y)),
+            state_clone,
+        );
+    });
+}
+
 fn start_drive_loop(
     car_url: String,
     license: String,
@@ -99,13 +169,13 @@ fn start_drive_loop(
     speed: f64,
     start_x: f64,
     start_y: f64,
+    dest_center: Option<(f64, f64)>,
     state: Arc<AppState>,
 ) {
     tokio::spawn(async move {
         let client = reqwest::Client::new();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // First command: spawn car at its lot coords (start_x, start_y), direction toward first waypoint
         if let Some(first) = path.first() {
             let dx = first.x - start_x;
             let dy = first.y - start_y;
@@ -188,10 +258,23 @@ fn start_drive_loop(
                 // Waits for the next poll interval
                 tokio::time::sleep(Duration::from_secs_f64(POLL_INTERVAL_SECS)).await;
             };
-            // If the car has reached the last segment, stop the car
             if is_last_segment {
-                send_command(&client, &car_url, &[("type", "stop"), ("license", &license)]).await;
-                println!("Car {} reached destination", license);
+                if let Some((cx, cy)) = dest_center {
+                    send_command(
+                        &client,
+                        &car_url,
+                        &[
+                            ("type", "go_to_lot_center"),
+                            ("center_x", &format!("{:.2}", cx)),
+                            ("center_y", &format!("{:.2}", cy)),
+                        ],
+                    )
+                    .await;
+                    println!("Car {} reached destination lot, driving to center", license);
+                } else {
+                    send_command(&client, &car_url, &[("type", "stop"), ("license", &license)]).await;
+                    println!("Car {} reached destination", license);
+                }
                 break;
             }
 
@@ -238,62 +321,62 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
             .content_type("text/plain")
             .body("Missing license, url, from, or to");
     }
-    // Gets the start x and y coordinates from the from lot
-    let (start_x, start_y) = match state.parking_spawns.lock().unwrap().get(&from_lot) {
-        // If the from lot is found, return the start x and y coordinates
-        Some(cfg) => (cfg.spawn[0], cfg.spawn[1]),
-        // If the from lot is not found, return a bad request
-        None => {
-            return HttpResponse::BadRequest()
-                .content_type("text/plain")
-                .body(format!("Unknown parking lot: {}", from_lot));
-        }
+    let (start_x, start_y, path) = {
+        let spawns = state.parking_spawns.lock().unwrap();
+        let from_cfg = match spawns.get(&from_lot) {
+            Some(c) => c,
+            None => {
+                return HttpResponse::BadRequest()
+                    .content_type("text/plain")
+                    .body(format!("Unknown parking lot: {}", from_lot));
+            }
+        };
+        let to_cfg = match spawns.get(&to_lot) {
+            Some(c) => c,
+            None => {
+                return HttpResponse::BadRequest()
+                    .content_type("text/plain")
+                    .body(format!("Unknown parking lot: {}", to_lot));
+            }
+        };
+        let entrance_from = (from_cfg.entrance[0], from_cfg.entrance[1]);
+        let entrance_to = (to_cfg.entrance[0], to_cfg.entrance[1]);
+        let path = match compute_path(
+            &state.city_graph.lock().unwrap(),
+            entrance_from.0,
+            entrance_from.1,
+            entrance_to.0,
+            entrance_to.1,
+        ) {
+            Some(p) => p,
+            None => {
+                return HttpResponse::BadRequest()
+                    .content_type("text/plain")
+                    .body(format!("No path from {} to {}", from_lot, to_lot));
+            }
+        };
+        (from_cfg.spawn[0], from_cfg.spawn[1], path)
     };
-    // Gets the destination x and y coordinates from the to lot
-    let (dest_x, dest_y) = match state.parking_spawns.lock().unwrap().get(&to_lot) {
-        // If the to lot is found, return the destination x and y coordinates
-        Some(cfg) => (cfg.spawn[0], cfg.spawn[1]),
-        // If the to lot is not found, return a bad request
-        None => {
-            return HttpResponse::BadRequest()
-                .content_type("text/plain")
-                .body(format!("Unknown parking lot: {}", to_lot));
-        }
-    };
-    // Computes the path from the start to the destination
-    let path = match compute_path(&state.city_graph.lock().unwrap(), start_x, start_y, dest_x, dest_y) {
-        // If the path is found, return the path
-        Some(p) => p,
-        // If the path is not found, return a bad request
-        None => {
-            return HttpResponse::BadRequest()
-                .content_type("text/plain")
-                .body(format!("No path from {} to {}", from_lot, to_lot));
-        }
-    };
-    // Creates a new car state
+
     let car = CarState {
         license: license.clone(),
         url: url.clone(),
         x: start_x,
         y: start_y,
     };
-    // Inserts the car state into the cars map
     state.cars.lock().unwrap().insert(license.clone(), car);
-    // Inserts the registered route into the registered routes map
     state
         .registered_routes
         .lock()
         .unwrap()
-        .insert(license.clone(), (url.clone(), path.clone(), start_x, start_y));
-    // Starts the drive loop
-    start_drive_loop(
+        .insert(license.clone(), (url.clone(), path.clone(), from_lot.clone(), to_lot.clone()));
+
+    run_car_trip(
         url.clone(),
         license.clone(),
         path,
-        DEFAULT_SPEED,
-        start_x,
-        start_y,
+        from_lot.clone(),
+        to_lot.clone(),
         Arc::clone(state.get_ref()),
     );
     // Prints the car registered message
@@ -369,8 +452,8 @@ async fn parking_lots(state: web::Data<Arc<AppState>>) -> HttpResponse {
         .iter()
         .map(|(id, cfg)| {
             format!(
-                "{}: center=({:.1},{:.1}) exit=({:.1},{:.1})",
-                id, cfg.spawn[0], cfg.spawn[1], cfg.exit[0], cfg.exit[1]
+                "{}: center=({:.1},{:.1}) entrance=({:.1},{:.1})",
+                id, cfg.spawn[0], cfg.spawn[1], cfg.entrance[0], cfg.entrance[1]
             )
         })
         .collect();
@@ -383,59 +466,6 @@ async fn parking_lots(state: web::Data<Arc<AppState>>) -> HttpResponse {
 /// Simple health probe used by the Python demo to wait for the server.
 async fn health() -> HttpResponse {
     HttpResponse::Ok().content_type("text/plain").body("OK")
-}
-
-/// `POST /switch-scene` – swap to a new city JSON, rebuild the graph, and clear all cars/routes.
-async fn switch_scene(state: web::Data<Arc<AppState>>, body: String) -> HttpResponse {
-    // Gets the scene from the body
-    let scene = body
-        // For each pair in the body, get the key and value
-        .split('&')
-        .find_map(|p| {
-            let mut kv = p.splitn(2, '=');
-            // Gets the key from the pair
-            let k = kv.next()?.trim();
-            let v = kv.next()?.trim();
-            if k == "scene" {
-                v.parse::<usize>().ok()
-            } else {
-                None
-            }
-        })
-        .and_then(|n| if (1..=3).contains(&n) { Some(n) } else { None });
-    // If the scene is not found, return a bad request
-    let Some(scene) = scene else {
-        return HttpResponse::BadRequest()
-            .content_type("text/plain")
-            .body("Missing or invalid scene=1|2|3");
-    };
-    // Gets the path from the scene
-    let path = SCENE_PATHS[scene - 1];
-    // Loads the city map from the path
-    let city_map = match CityMap::load(path) {
-        // If the city map is found, return the city map
-        Ok(m) => m,
-        // If the city map is not found, return a bad request
-        Err(e) => {
-            return HttpResponse::InternalServerError()
-                .content_type("text/plain")
-                .body(format!("Failed to load {}: {}", path, e));
-        }
-    };
-    // Builds the graph for the city map
-    let graph = city_map.build_graph();
-    // Clears the cars in the state
-    state.cars.lock().unwrap().clear();
-    // Clears the registered routes in the state
-    state.registered_routes.lock().unwrap().clear();
-    // Updates the city graph in the state
-    *state.city_graph.lock().unwrap() = graph;
-    // Updates the parking spawns in the state
-    *state.parking_spawns.lock().unwrap() = city_map.parking_spawns;
-    println!("Switched to scene {}", scene);
-    HttpResponse::Ok()
-        .content_type("text/plain")
-        .body(format!("ok scene={}", scene))
 }
 
 /// `POST /reset-car` – restart all cars (or a subset) from their original spawn positions.
@@ -466,23 +496,17 @@ async fn reset_car(state: web::Data<Arc<AppState>>, body: String) -> HttpRespons
             })
             .collect()
     };
-    // Gets the routes from the state
     let routes = state.registered_routes.lock().unwrap();
-    // For each license, start the drive loop
     for license in licenses {
-        // If the route is found, start the drive loop
-        if let Some((ref url, ref path, start_x, start_y)) = routes.get(&license) {
-            // Starts the drive loop
-            start_drive_loop(
+        if let Some((ref url, ref path, ref from_lot, ref to_lot)) = routes.get(&license) {
+            run_car_trip(
                 url.clone(),
                 license.clone(),
                 path.clone(),
-                DEFAULT_SPEED,
-                *start_x,
-                *start_y,
+                from_lot.clone(),
+                to_lot.clone(),
                 Arc::clone(state.get_ref()),
             );
-            // Prints the car reset message
             println!("Car {} reset to start", license);
         }
     }
@@ -535,7 +559,6 @@ async fn main() -> std::io::Result<()> {
             .route("/car-positions", web::get().to(car_positions))
             .route("/parking-lots", web::get().to(parking_lots))
             .route("/health", web::get().to(health))
-            .route("/switch-scene", web::post().to(switch_scene))
             .route("/reset-car", web::post().to(reset_car))
     })
     // Binds the server to the address

@@ -22,12 +22,20 @@ pub struct Segment {
     pub pts: Vec<[f64; 2]>,
 }
 
-// Defines the ParkingLotConfig struct, which contains the spawn and exit points of the parking lot
+// Parking lot: center (spawn), rectangular size, and road entrance (point on road segment).
 #[derive(Debug, Deserialize, Clone)]
 pub struct ParkingLotConfig {
     #[serde(alias = "center")]
     pub spawn: [f64; 2],
-    pub exit: [f64; 2],
+    #[serde(default = "default_lot_size")]
+    pub size: [f64; 2],
+    /// Point on the road where the lot meets the roadway (car enters/exits here).
+    #[serde(alias = "exit")]
+    pub entrance: [f64; 2],
+}
+
+fn default_lot_size() -> [f64; 2] {
+    [40.0, 40.0]
 }
 
 // Defines the ParkingLotSpawns type, which is a hashmap of parking lot ids and their configurations
@@ -83,25 +91,24 @@ impl CityMap {
         // Initializes the parking spawns hashmap
         let mut parking_spawns = ParkingLotSpawns::new();
         if let Some(pl) = v.get("parking_lots").and_then(|x| x.as_object()) {
-            // For each parking lot, get the id and object
             for (id, obj) in pl {
-                // If the center and exit are some, get the center and exit points
-                if let (Some(center), Some(exit)) = (
+                let entrance_arr = obj.get("entrance").or_else(|| obj.get("exit")).and_then(|e| e.as_array()).filter(|a| a.len() >= 2);
+                if let (Some(center), Some(entrance)) = (
                     obj.get("center").and_then(|c| c.as_array()).filter(|a| a.len() >= 2),
-                    obj.get("exit").and_then(|e| e.as_array()).filter(|a| a.len() >= 2),
+                    entrance_arr,
                 ) {
-                    // Converts the center and exit points to arrays of f64
                     let spawn = [
                         center[0].as_f64().unwrap_or(0.0),
                         center[1].as_f64().unwrap_or(0.0),
                     ];
-                    // Converts the exit points to arrays of f64
-                    let exit_pt = [
-                        exit[0].as_f64().unwrap_or(0.0),
-                        exit[1].as_f64().unwrap_or(0.0),
+                    let entrance_pt = [
+                        entrance[0].as_f64().unwrap_or(0.0),
+                        entrance[1].as_f64().unwrap_or(0.0),
                     ];
-                    // Inserts the parking lot config into the parking spawns hashmap
-                    parking_spawns.insert(id.clone(), ParkingLotConfig { spawn, exit: exit_pt });
+                    let size = obj.get("size").and_then(|s| s.as_array()).filter(|a| a.len() >= 2)
+                        .map(|a| [a[0].as_f64().unwrap_or(40.0), a[1].as_f64().unwrap_or(40.0)])
+                        .unwrap_or([40.0, 40.0]);
+                    parking_spawns.insert(id.clone(), ParkingLotConfig { spawn, size, entrance: entrance_pt });
                 }
             }
         }

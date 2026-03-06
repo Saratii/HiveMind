@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HiveMind demo: visualizes roads from city.json, spawns cars, shows them driving.
+HiveMind demo: visualizes roads from city.json, one car A->B.
 Run from project root. Server must already be running (cargo run in hive_mind_server).
 """
 
@@ -21,37 +21,31 @@ except ImportError:
 # Paths
 ROOT = Path(__file__).resolve().parent
 CITY_JSON = ROOT / "city.json"
-SCENE_JSON = [ROOT / "city_scene1.json", ROOT / "city_scene2.json", ROOT / "city_scene3.json"]
 CAR_SCRIPT = ROOT / "car" / "car.py"
 SERVER_URL = "http://127.0.0.1:8080"
 
-# Scene 1: 1 car A->B. Scene 2: 2 cars both to C. Scene 3: 2 cars A<->B. (license, port, from_lot, to_lot)
-SCENE_CARS = [
-    [("CAR001", 9001, "A", "B")],
-    [("CAR001", 9001, "A", "C"), ("CAR002", 9002, "B", "C")],
-    [("CAR001", 9001, "A", "B"), ("CAR002", 9002, "B", "A")],
-]
+# One car: CAR001, port 9001, A -> B
+CAR_LICENSE, CAR_PORT, FROM_LOT, TO_LOT = "CAR001", 9001, "A", "B"
 
 # Viz config
 POLL_INTERVAL_MS = 500
 WINDOW_SIZE = (900, 600)
 MARGIN = 60
-MARGIN_LEFT = 125
+MARGIN_LEFT = 60
 ROAD_COLOR = (80, 80, 80)
 ROAD_WIDTH = 10
 LOT_COLOR = (100, 140, 180)
 LOT_RADIUS = 30
-CAR_COLORS = [(220, 60, 60), (60, 180, 80), (80, 120, 220)]
+CAR_COLORS = [(220, 60, 60)]
 CAR_RADIUS = 14
 BG_COLOR = (30, 35, 45)
 TEXT_COLOR = (200, 200, 200)
 GRID_COLOR = (50, 55, 65)
 
 
-def load_city(scene=1):
-    """Load city JSON for the given scene (1, 2, or 3)."""
-    path = SCENE_JSON[scene - 1] if 1 <= scene <= 3 else CITY_JSON
-    with open(path) as f:
+def load_city():
+    """Load city from city.json."""
+    with open(CITY_JSON) as f:
         return json.load(f)
 
 
@@ -61,7 +55,7 @@ def world_bounds(city):
         all_pts.extend(seg.get("pts", []))
     for lot in city.get("parking_lots", {}).values():
         all_pts.append(lot.get("center", [0, 0]))
-        all_pts.append(lot.get("exit", [0, 0]))
+        all_pts.append(lot.get("entrance", lot.get("exit", [0, 0])))
     if not all_pts:
         return -100, 100, -100, 100
     xs = [p[0] for p in all_pts]
@@ -112,7 +106,6 @@ def wait_for_server(timeout=5):
 
 
 def kill_processes_on_ports(ports):
-    """Kill any process listening on the given ports (Windows: netstat + taskkill)."""
     if sys.platform != "win32":
         return
     for port in ports:
@@ -141,8 +134,8 @@ def kill_processes_on_ports(ports):
             pass
     time.sleep(1.0)
 
+
 def reset_cars_to_start():
-    """Ask server to reset all cars to start and restart their routes."""
     req = urllib.request.Request(
         f"{SERVER_URL}/reset-car",
         data=b"",
@@ -151,59 +144,32 @@ def reset_cars_to_start():
     )
     try:
         urllib.request.urlopen(req, timeout=3)
-        print("Reset: cars restarted at start.", flush=True)
+        print("Reset: car restarted at start.", flush=True)
     except Exception as e:
         print(f"Reset failed: {e}", flush=True)
 
 
-def switch_scene(scene: int):
-    """Tell server to load the given scene map (1, 2, or 3)."""
-    data = f"scene={scene}".encode()
-    req = urllib.request.Request(
-        f"{SERVER_URL}/switch-scene",
-        data=data,
-        method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    try:
-        urllib.request.urlopen(req, timeout=3)
-    except Exception as e:
-        print(f"Switch scene failed: {e}", flush=True)
-
-
-def spawn_cars(scene=1):
-    """Spawn cars for the given scene (1, 2, or 3)."""
-    cars = SCENE_CARS[scene - 1] if 1 <= scene <= 3 else SCENE_CARS[0]
-    ports = [c[1] for c in cars]
-    kill_processes_on_ports(ports)
-    procs = []
+def spawn_car():
+    """Spawn one car CAR001 on port 9001, A -> B."""
+    kill_processes_on_ports([CAR_PORT])
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platform == "win32" else 0
-    for license_id, port, from_lot, to_lot in cars:
-        cmd = [sys.executable, str(CAR_SCRIPT), license_id, str(port), from_lot, to_lot]
-        p = subprocess.Popen(
-            cmd,
-            cwd=ROOT,
-            creationflags=flags,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        procs.append(p)
-        time.sleep(2.0)
-    return procs
+    cmd = [sys.executable, str(CAR_SCRIPT), CAR_LICENSE, str(CAR_PORT), FROM_LOT, TO_LOT]
+    p = subprocess.Popen(
+        cmd,
+        cwd=ROOT,
+        creationflags=flags,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(2.0)
+    return p
 
 
-# Left-side scene buttons: x, y, width, height (wide enough for "A to B to A")
-SCENE_BTN_X, SCENE_BTN_W, SCENE_BTN_H = 12, 108, 30
-SCENE_BTN_Y_START = 70
-SCENE_BTN_GAP = 6
-
-
-def run_viz(procs, current_scene):
-    """current_scene is a list of one int (1, 2, or 3) so we can mutate it on button click."""
+def run_viz(proc):
     w, h = WINDOW_SIZE
     pygame.init()
     screen = pygame.display.set_mode(WINDOW_SIZE, pygame.RESIZABLE)
-    pygame.display.set_caption("HiveMind - Road Demo")
+    pygame.display.set_caption("HiveMind - One car A -> B")
     font = pygame.font.Font(None, 28)
     clock = pygame.time.Clock()
     last_poll = 0
@@ -213,28 +179,9 @@ def run_viz(procs, current_scene):
     def get_reset_rect():
         return pygame.Rect(w - 110, h - 38, 90, 26)
 
-    def get_scene_rect(n):
-        return pygame.Rect(SCENE_BTN_X, SCENE_BTN_Y_START + (n - 1) * (SCENE_BTN_H + SCENE_BTN_GAP), SCENE_BTN_W, SCENE_BTN_H)
-
-    def apply_scene(n):
-        if n == current_scene[0]:
-            return
-        switch_scene(n)
-        for p in procs:
-            try:
-                p.terminate()
-            except Exception:
-                pass
-        time.sleep(1.0)
-        procs[:] = spawn_cars(n)
-        current_scene[0] = n
-        time.sleep(2.0)
-        print(f"Scene {n}: {' '.join(f'{c[0]} {c[2]}->{c[3]}' for c in SCENE_CARS[n - 1])}", flush=True)
-
     running = True
     while running:
-        scene_num = current_scene[0]
-        city = load_city(scene_num)
+        city = load_city()
         x_min, x_max, y_min, y_max = world_bounds(city)
 
         for event in pygame.event.get():
@@ -246,10 +193,6 @@ def run_viz(procs, current_scene):
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if get_reset_rect().collidepoint(event.pos):
                     reset_cars_to_start()
-                for n in (1, 2, 3):
-                    if get_scene_rect(n).collidepoint(event.pos):
-                        apply_scene(n)
-                        break
 
         now = pygame.time.get_ticks()
         if now - last_poll > POLL_INTERVAL_MS:
@@ -261,8 +204,6 @@ def run_viz(procs, current_scene):
             else:
                 cars = result if isinstance(result, list) else []
                 error_msg = None
-                for lic, cx, cy in cars:
-                    print(f"  {lic}: x={cx:.1f}  y={cy:.1f}", flush=True)
 
         screen.fill(BG_COLOR)
 
@@ -284,10 +225,22 @@ def run_viz(procs, current_scene):
 
         for lot_id, lot in city.get("parking_lots", {}).items():
             cx, cy = lot.get("center", [0, 0])
-            sx, sy = to_screen(cx, cy, x_min, x_max, y_min, y_max, w, h)
-            pygame.draw.circle(screen, LOT_COLOR, (sx, sy), LOT_RADIUS, 3)
-            label = font.render(lot_id, True, LOT_COLOR)
-            screen.blit(label, (sx - label.get_width() // 2, sy - 10))
+            size = lot.get("size", [40, 40])
+            if isinstance(size, (list, tuple)) and len(size) >= 2:
+                hw, hh = float(size[0]) / 2, float(size[1]) / 2
+                scx, scy = to_screen(cx, cy, x_min, x_max, y_min, y_max, w, h)
+                scale_x = (w - MARGIN_LEFT - MARGIN) / (x_max - x_min) if x_max != x_min else 1
+                scale_y = (h - 2 * MARGIN) / (y_max - y_min) if y_max != y_min else 1
+                sw, sh = hw * 2 * scale_x, hh * 2 * scale_y
+                rect = pygame.Rect(scx - sw / 2, scy - sh / 2, sw, sh)
+                pygame.draw.rect(screen, LOT_COLOR, rect, 3)
+                label = font.render(lot_id, True, LOT_COLOR)
+                screen.blit(label, (scx - label.get_width() // 2, scy - 10))
+            else:
+                sx, sy = to_screen(cx, cy, x_min, x_max, y_min, y_max, w, h)
+                pygame.draw.circle(screen, LOT_COLOR, (sx, sy), LOT_RADIUS, 3)
+                label = font.render(lot_id, True, LOT_COLOR)
+                screen.blit(label, (sx - label.get_width() // 2, sy - 10))
 
         for i, (license_id, cx, cy) in enumerate(cars):
             sx, sy = to_screen(cx, cy, x_min, x_max, y_min, y_max, w, h)
@@ -297,25 +250,12 @@ def run_viz(procs, current_scene):
             label = font.render(license_id, True, color)
             screen.blit(label, (sx - label.get_width() // 2, sy - CAR_RADIUS - 18))
 
-        status = f"Cars: {len(cars)}  |  Scene {scene_num}  |  {SERVER_URL}"
+        status = f"Car: {FROM_LOT} -> {TO_LOT}  |  {SERVER_URL}"
         if error_msg:
             status = f"Server error: {error_msg}"
         text = font.render(status, True, TEXT_COLOR)
         screen.blit(text, (10, h - 32))
 
-        # Scene buttons (left side)
-        scene_labels = ["Scene 1", "Scene 2", "Scene 3"]
-        for n in (1, 2, 3):
-            r = get_scene_rect(n)
-            is_active = n == scene_num
-            color = (90, 130, 180) if is_active else (60, 70, 85)
-            border = (140, 180, 220) if is_active else (80, 90, 100)
-            pygame.draw.rect(screen, color, r)
-            pygame.draw.rect(screen, border, r, 2)
-            lbl = font.render(scene_labels[n - 1], True, (255, 255, 255))
-            screen.blit(lbl, (r.x + (r.w - lbl.get_width()) // 2, r.y + 6))
-
-        # Reset button
         reset_rect = get_reset_rect()
         pygame.draw.rect(screen, (70, 100, 160), reset_rect)
         pygame.draw.rect(screen, (120, 150, 220), reset_rect, 2)
@@ -329,31 +269,23 @@ def run_viz(procs, current_scene):
 
 
 def main():
-    print("HiveMind demo")
+    print("HiveMind demo - one car A -> B")
     print("Checking server...")
     if not wait_for_server():
         print("ERROR: Server not running. Start it first:")
         print("  cd hive_mind_server")
         print("  cargo run")
         sys.exit(1)
-    # Start on Scene 1 (1 car A->B)
-    switch_scene(1)
-    time.sleep(0.5)
-    print("Server OK. Scene 1: 1 car CAR001 A->B...")
-    procs = spawn_cars(1)
-    time.sleep(2.5)
-    print("Cars spawned. Scene 1: 1 car | Scene 2: both to C | Scene 3: 2 cars A<->B. Bottom-right: Reset.\n")
+    print("Server OK. Spawning car CAR001 A -> B...")
+    proc = spawn_car()
     time.sleep(1)
-    current_scene = [1]
-
     try:
-        run_viz(procs, current_scene)
+        run_viz(proc)
     finally:
-        for p in procs:
-            try:
-                p.terminate()
-            except Exception:
-                pass
+        try:
+            proc.terminate()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

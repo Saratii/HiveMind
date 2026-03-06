@@ -24,7 +24,7 @@ use pathfinding::{compute_path, Waypoint};
 
 const DEFAULT_SPEED: f64 = 75.0;
 const BIND_ADDR: &str = "0.0.0.0:8080";
-const WAYPOINT_PROXIMITY: f64 = 60.0;  // distance at which car is considered "at" a waypoint (or destination)
+const WAYPOINT_PROXIMITY: f64 = 60.0;
 const MIN_PROGRESS_FROM_WP: f64 = 10.0;
 const POLL_INTERVAL_SECS: f64 = 0.5;
 const ENTRANCE_PROXIMITY: f64 = 5.0;
@@ -210,10 +210,10 @@ fn start_drive_loop(
             };
             let is_last_segment = i + 1 == path.len() - 1;
 
-            if speed <= 0.0 || wp.dist_to_next <= 0.0 {
+            if speed <= 0.0 {
                 continue;
             }
-
+            // Don't skip when dist_to_next is 0 (graph nodes) — we still must wait and send next direction
             let travel_secs = wp.dist_to_next / speed;
             let sleep_secs = (travel_secs - POLL_INTERVAL_SECS).max(0.0);
             tokio::time::sleep(Duration::from_secs_f64(sleep_secs)).await;
@@ -221,40 +221,31 @@ fn start_drive_loop(
             // Wait until car is near target: for last segment wait for destination (next), else wait for wp
             let target_x = if is_last_segment { next.x } else { wp.x };
             let target_y = if is_last_segment { next.y } else { wp.y };
-            let _reached = loop {
-                // Gets the position of the car
+            // true = reached by being close (smooth, snap ok); false = reached by overshoot (don't snap, avoid backward warp)
+            let reached_by_proximity = loop {
                 match get_position(&client, &car_url).await {
                     Some((cx, cy)) => {
-                        // Calculates the distance to the target
                         let dist_to_target = (cx - target_x).hypot(cy - target_y);
-                        // Calculates the distance from the previous position
                         let dist_from_prev = (cx - prev_x).hypot(cy - prev_y);
                         let seg_dx = target_x - prev_x;
                         let seg_dy = target_y - prev_y;
-                        // Calculates the length of the segment squared
                         let seg_len_sq = seg_dx * seg_dx + seg_dy * seg_dy;
-                        // Calculates if the car has overshot the segment
                         let overshot = seg_len_sq > 1e-9
                             && (cx - prev_x) * seg_dx + (cy - prev_y) * seg_dy >= seg_len_sq;
-                        // Calculates if the car has made progress
                         let made_progress = dist_from_prev >= MIN_PROGRESS_FROM_WP || overshot;
-                        // Calculates if the car is near the target
                         let is_near = (dist_to_target < WAYPOINT_PROXIMITY || overshot) && made_progress;
-                        // Updates the car's position in the map
                         if let Ok(mut map) = state.cars.lock() {
-                            // Updates the car's position in the map
                             if let Some(c) = map.get_mut(&license) {
                                 c.x = cx;
                                 c.y = cy;
                             }
                         }
                         if is_near {
-                            break;
+                            break dist_to_target < WAYPOINT_PROXIMITY;
                         }
                     }
                     None => {}
                 }
-                // Waits for the next poll interval
                 tokio::time::sleep(Duration::from_secs_f64(POLL_INTERVAL_SECS)).await;
             };
             if is_last_segment {
@@ -277,19 +268,32 @@ fn start_drive_loop(
                 break;
             }
 
-            // Send direction from this wp toward next waypoint
-            send_command(
-                &client,
-                &car_url,
-                &[
-                    ("type", "set_route"),
-                    ("license", &license),
-                    ("speed", &format!("{:.2}", speed)),
-                    ("direction_x", &format!("{:.4}", wp.dir_x)),
-                    ("direction_y", &format!("{:.4}", wp.dir_y)),
-                ],
-            )
-            .await;
+            // Direction from this wp to next (wp.dir_x/dir_y can be 0 at graph nodes, so always compute)
+            let dx = next.x - wp.x;
+            let dy = next.y - wp.y;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let (dir_x, dir_y) = if dist > 1e-9 {
+                (dx / dist, dy / dist)
+            } else {
+                (wp.dir_x, wp.dir_y)
+            };
+            // Only snap to waypoint when we reached it by proximity; if we overshot, don't warp car backward
+            let mut params: Vec<(&str, String)> = vec![
+                ("type", "set_route".into()),
+                ("license", license.clone()),
+                ("speed", format!("{:.2}", speed)),
+                ("direction_x", format!("{:.4}", dir_x)),
+                ("direction_y", format!("{:.4}", dir_y)),
+            ];
+            if reached_by_proximity {
+                params.push(("pos_x", format!("{:.2}", wp.x)));
+                params.push(("pos_y", format!("{:.2}", wp.y)));
+            }
+            let params_ref: Vec<(&str, &str)> = params
+                .iter()
+                .map(|(k, v)| (*k, v.as_str()))
+                .collect();
+            send_command(&client, &car_url, &params_ref).await;
         }
     });
 }

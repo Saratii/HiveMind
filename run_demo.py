@@ -4,10 +4,12 @@ HiveMind demo: visualizes roads from city.json. Spawn cars by clicking Spawn Car
 Reset removes all active cars. Run from project root. Server must be running (cargo run in hive_mind_server).
 """
 
+import colorsys
 import json
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -33,8 +35,16 @@ ROAD_COLOR = (80, 80, 80)
 ROAD_WIDTH = 10
 LOT_COLOR = (60, 120, 220)   # blue
 LOT_RADIUS = 30
-CAR_COLORS = [(220, 60, 60), (60, 180, 80), (80, 120, 220), (200, 160, 60), (180, 80, 200)]
-CAR_RADIUS = 14
+CAR_RADIUS = 2
+# Golden-ratio hue step so each car gets a distinct color (no duplicates even with 100+ cars)
+_GOLDEN = 0.618033988749895
+
+
+def _car_color_for_index(index: int) -> tuple:
+    """Return a unique RGB color (0-255) for car index; maximally distinct hues."""
+    h = (index * _GOLDEN) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(h, 0.85, 1.0)
+    return (int(r * 255), int(g * 255), int(b * 255))
 BG_COLOR = (30, 35, 45)
 TEXT_COLOR = (200, 200, 200)
 GRID_COLOR = (50, 55, 65)
@@ -194,21 +204,44 @@ def spawn_car(license_id, port, from_lot, to_lot):
         stdout=subprocess.DEVNULL,
         stderr=None,  # show in console so user sees e.g. "Registration failed: HTTP Error 400"
     )
-    time.sleep(2.0)
+    time.sleep(1.0)  # give car process a moment to bind port (reduced from 2.0)
     return p
 
 
-def run_viz(procs, spawn_state):
-    """procs: list of (license, port, Popen). spawn_state: [mode, start_lot] with mode in (None, 'start_lot', 'end_lot')."""
+def _spawn_car_in_background(license_id, port, from_lot, to_lot, procs):
+    """Run in a thread: spawn car, wait for registration, append to procs if success."""
+    try:
+        p = spawn_car(license_id, port, from_lot, to_lot)
+        # Poll for registration instead of one long sleep (max ~3s)
+        for _ in range(6):
+            time.sleep(0.5)
+            result = fetch_car_positions()
+            if isinstance(result, list) and any(lic == license_id for lic, _x, _y in result):
+                procs.append((license_id, port, p))
+                print(f"Spawned {license_id}: {from_lot} -> {to_lot}", flush=True)
+                return
+        try:
+            p.terminate()
+        except Exception:
+            pass
+        print(f"Registration failed for {license_id} ({from_lot} -> {to_lot}). No path? Restart server after city.json changes.", flush=True)
+    except Exception as e:
+        print(f"Spawn failed for {license_id}: {e}", flush=True)
+
+
+def run_viz(procs, spawn_state, next_car_index):
+    """procs: list of (license, port, Popen). spawn_state: [mode, start_lot]. next_car_index: [int] so each spawn gets a unique license/port even when overlapping."""
     w, h = WINDOW_SIZE
     pygame.init()
     screen = pygame.display.set_mode(WINDOW_SIZE, pygame.RESIZABLE)
     pygame.display.set_caption("HiveMind - Spawn cars by picking start and end lots")
     font = pygame.font.Font(None, 28)
+    car_label_font = pygame.font.Font(None, 19)  # 2/3 of 28 for smaller car text
     clock = pygame.time.Clock()
     last_poll = 0
     cars = []
     error_msg = None
+    car_colors = {}  # license_id -> color; keeps each car's color stable when new cars spawn
 
     def get_reset_rect():
         return pygame.Rect(w - 110, h - 38, 90, 26)
@@ -255,26 +288,19 @@ def run_viz(procs, spawn_state):
                 elif spawn_mode == "end_lot" and lots:
                     lot_id = screen_to_lot(event.pos[0], event.pos[1], city, x_min, x_max, y_min, y_max, w, h)
                     if lot_id and lot_id != start_lot:
-                        # Spawn new car and only add to procs if server actually registers it
-                        n = len(procs) + 1
+                        # Spawn in background so the UI stays responsive (no freeze)
+                        n = next_car_index[0]
+                        next_car_index[0] += 1
                         license_id = f"CAR{n:03d}"
                         port = 9000 + n
-                        p = spawn_car(license_id, port, start_lot, lot_id)
                         spawn_state[0] = None
                         spawn_state[1] = None
-                        # Wait for server to have the car (registration can take a moment)
-                        time.sleep(2.5)
-                        result = fetch_car_positions()
-                        registered = isinstance(result, list) and any(lic == license_id for lic, _x, _y in result)
-                        if registered:
-                            procs.append((license_id, port, p))
-                            print(f"Spawned {license_id}: {start_lot} -> {lot_id}", flush=True)
-                        else:
-                            try:
-                                p.terminate()
-                            except Exception:
-                                pass
-                            print(f"Registration failed for {license_id} ({start_lot} -> {lot_id}). No path? Restart server after city.json changes.", flush=True)
+                        t = threading.Thread(
+                            target=_spawn_car_in_background,
+                            args=(license_id, port, start_lot, lot_id, procs),
+                            daemon=True,
+                        )
+                        t.start()
 
         now = pygame.time.get_ticks()
         if now - last_poll > POLL_INTERVAL_MS:
@@ -324,13 +350,16 @@ def run_viz(procs, spawn_state):
                 label = font.render(lot_id, True, LOT_COLOR)
                 screen.blit(label, (sx - label.get_width() // 2, sy - 10))
 
-        for i, (license_id, cx, cy) in enumerate(cars):
+        for (license_id, cx, cy) in cars:
             sx, sy = to_screen(cx, cy, x_min, x_max, y_min, y_max, w, h)
-            color = CAR_COLORS[i % len(CAR_COLORS)]
+            if license_id not in car_colors:
+                car_colors[license_id] = _car_color_for_index(len(car_colors))
+            color = car_colors[license_id]
             pygame.draw.circle(screen, color, (sx, sy), CAR_RADIUS)
-            pygame.draw.circle(screen, (255, 255, 255), (sx, sy), CAR_RADIUS, 2)
-            label = font.render(license_id, True, color)
-            screen.blit(label, (sx - label.get_width() // 2, sy - CAR_RADIUS - 18))
+            outline = 1 if CAR_RADIUS <= 5 else 2
+            pygame.draw.circle(screen, (255, 255, 255), (sx, sy), CAR_RADIUS, outline)
+            label = car_label_font.render(license_id, True, color)
+            screen.blit(label, (sx - label.get_width() // 2, sy - CAR_RADIUS - 12))
 
         # Top-left: Spawn Car button or prompt
         pygame.draw.rect(screen, (70, 100, 160), spawn_rect)
@@ -369,8 +398,9 @@ def main():
     print("Server OK.")
     procs = []  # list of (license, port, Popen)
     spawn_state = [None, None]  # [mode, start_lot]
+    next_car_index = [1]  # unique license/port per spawn (incremented when spawn starts)
     try:
-        run_viz(procs, spawn_state)
+        run_viz(procs, spawn_state, next_car_index)
     finally:
         remove_all_cars(procs)
 

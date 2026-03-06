@@ -25,7 +25,7 @@ WINDOW_SIZE = (900, 600)
 MARGIN = 60
 ROAD_COLOR = (80, 80, 80)
 ROAD_WIDTH = 8
-LOT_COLOR = (100, 140, 180)
+LOT_COLOR = (60, 120, 220)   # blue
 LOT_RADIUS = 25
 CAR_COLORS = [(220, 60, 60), (60, 180, 80), (60, 120, 220)]
 CAR_RADIUS = 12
@@ -45,7 +45,7 @@ def world_bounds(city):
         all_pts.extend(seg.get("pts", []))
     for lot_id, lot in city.get("parking_lots", {}).items():
         all_pts.append(lot.get("center", [0, 0]))
-        all_pts.append(lot.get("exit", [0, 0]))
+        all_pts.append(lot.get("entrance", lot.get("exit", [0, 0])))
     if not all_pts:
         return -100, 100, -100, 100
     xs = [p[0] for p in all_pts]

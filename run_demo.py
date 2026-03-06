@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-HiveMind demo: visualizes roads from city.json, one car A->B.
-Run from project root. Server must already be running (cargo run in hive_mind_server).
+HiveMind demo: visualizes roads from city.json. Spawn cars by clicking Spawn Car, then start lot, then end lot.
+Reset removes all active cars. Run from project root. Server must be running (cargo run in hive_mind_server).
 """
 
 import json
@@ -24,9 +24,6 @@ CITY_JSON = ROOT / "city.json"
 CAR_SCRIPT = ROOT / "car" / "car.py"
 SERVER_URL = "http://127.0.0.1:8080"
 
-# One car: CAR001, port 9001, A -> B
-CAR_LICENSE, CAR_PORT, FROM_LOT, TO_LOT = "CAR001", 9001, "A", "B"
-
 # Viz config
 POLL_INTERVAL_MS = 500
 WINDOW_SIZE = (900, 600)
@@ -34,13 +31,15 @@ MARGIN = 60
 MARGIN_LEFT = 60
 ROAD_COLOR = (80, 80, 80)
 ROAD_WIDTH = 10
-LOT_COLOR = (100, 140, 180)
+LOT_COLOR = (60, 120, 220)   # blue
 LOT_RADIUS = 30
-CAR_COLORS = [(220, 60, 60)]
+CAR_COLORS = [(220, 60, 60), (60, 180, 80), (80, 120, 220), (200, 160, 60), (180, 80, 200)]
 CAR_RADIUS = 14
 BG_COLOR = (30, 35, 45)
 TEXT_COLOR = (200, 200, 200)
 GRID_COLOR = (50, 55, 65)
+# Top-left buttons
+SPAWN_BTN_X, SPAWN_BTN_Y, SPAWN_BTN_W, SPAWN_BTN_H = 12, 12, 120, 32
 
 
 def load_city():
@@ -74,6 +73,30 @@ def to_screen(x, y, x_min, x_max, y_min, y_max, w, h):
     else:
         sy = h - MARGIN - (y - y_min) / (y_max - y_min) * (h - 2 * MARGIN)
     return int(sx), int(sy)
+
+
+def screen_to_lot(sx, sy, city, x_min, x_max, y_min, y_max, w, h):
+    """Return lot_id if (sx, sy) is inside a parking lot, else None."""
+    lots = city.get("parking_lots", {})
+    if not lots:
+        return None
+    for lot_id, lot in lots.items():
+        cx, cy = lot.get("center", [0, 0])
+        size = lot.get("size", [40, 40])
+        if isinstance(size, (list, tuple)) and len(size) >= 2:
+            hw, hh = float(size[0]) / 2, float(size[1]) / 2
+            scx, scy = to_screen(cx, cy, x_min, x_max, y_min, y_max, w, h)
+            scale_x = (w - MARGIN_LEFT - MARGIN) / (x_max - x_min) if x_max != x_min else 1
+            scale_y = (h - 2 * MARGIN) / (y_max - y_min) if y_max != y_min else 1
+            sw, sh = hw * 2 * scale_x, hh * 2 * scale_y
+            rect = pygame.Rect(scx - sw / 2, scy - sh / 2, sw, sh)
+            if rect.collidepoint(sx, sy):
+                return lot_id
+        else:
+            scx, scy = to_screen(cx, cy, x_min, x_max, y_min, y_max, w, h)
+            if (sx - scx) ** 2 + (sy - scy) ** 2 <= LOT_RADIUS ** 2:
+                return lot_id
+    return None
 
 
 def fetch_car_positions():
@@ -135,41 +158,52 @@ def kill_processes_on_ports(ports):
     time.sleep(1.0)
 
 
-def reset_cars_to_start():
-    req = urllib.request.Request(
-        f"{SERVER_URL}/reset-car",
-        data=b"",
-        method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
+def remove_all_cars(procs):
+    """Tell server to clear all cars, then kill all car processes."""
     try:
+        req = urllib.request.Request(
+            f"{SERVER_URL}/remove-all-cars",
+            data=b"",
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
         urllib.request.urlopen(req, timeout=3)
-        print("Reset: car restarted at start.", flush=True)
     except Exception as e:
-        print(f"Reset failed: {e}", flush=True)
+        print(f"Remove-all failed: {e}", flush=True)
+    ports = [port for _lic, port, _ in procs]
+    kill_processes_on_ports(ports)
+    for _lic, _port, p in procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    procs.clear()
+    print("Reset: all cars removed.", flush=True)
 
 
-def spawn_car():
-    """Spawn one car CAR001 on port 9001, A -> B."""
-    kill_processes_on_ports([CAR_PORT])
+def spawn_car(license_id, port, from_lot, to_lot):
+    """Spawn one car with given license, port, from_lot -> to_lot. Returns Popen."""
+    kill_processes_on_ports([port])
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platform == "win32" else 0
-    cmd = [sys.executable, str(CAR_SCRIPT), CAR_LICENSE, str(CAR_PORT), FROM_LOT, TO_LOT]
+    cmd = [sys.executable, str(CAR_SCRIPT), license_id, str(port), from_lot, to_lot]
+    # Don't suppress stderr so "Registration failed" from the car is visible
     p = subprocess.Popen(
         cmd,
         cwd=ROOT,
         creationflags=flags,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=None,  # show in console so user sees e.g. "Registration failed: HTTP Error 400"
     )
     time.sleep(2.0)
     return p
 
 
-def run_viz(proc):
+def run_viz(procs, spawn_state):
+    """procs: list of (license, port, Popen). spawn_state: [mode, start_lot] with mode in (None, 'start_lot', 'end_lot')."""
     w, h = WINDOW_SIZE
     pygame.init()
     screen = pygame.display.set_mode(WINDOW_SIZE, pygame.RESIZABLE)
-    pygame.display.set_caption("HiveMind - One car A -> B")
+    pygame.display.set_caption("HiveMind - Spawn cars by picking start and end lots")
     font = pygame.font.Font(None, 28)
     clock = pygame.time.Clock()
     last_poll = 0
@@ -183,6 +217,16 @@ def run_viz(proc):
     while running:
         city = load_city()
         x_min, x_max, y_min, y_max = world_bounds(city)
+        spawn_mode, start_lot = spawn_state[0], spawn_state[1]
+        lots = city.get("parking_lots", {})
+        if spawn_mode is None:
+            spawn_btn_label = "Spawn Car"
+        elif spawn_mode == "start_lot":
+            spawn_btn_label = "Click a starting parking lot"
+        else:
+            spawn_btn_label = f"Pick ending lot (from {start_lot})"
+        spawn_btn_w = max(SPAWN_BTN_W, font.size(spawn_btn_label)[0] + 16)
+        spawn_rect = pygame.Rect(SPAWN_BTN_X, SPAWN_BTN_Y, spawn_btn_w, SPAWN_BTN_H)
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -192,7 +236,45 @@ def run_viz(proc):
                 screen = pygame.display.set_mode((w, h), pygame.RESIZABLE)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if get_reset_rect().collidepoint(event.pos):
-                    reset_cars_to_start()
+                    remove_all_cars(procs)
+                    continue
+                if spawn_rect.collidepoint(event.pos):
+                    if spawn_mode is None:
+                        spawn_state[0] = "start_lot"
+                        spawn_state[1] = None
+                    else:
+                        spawn_state[0] = None
+                        spawn_state[1] = None
+                    continue
+                # Click on map: treat as lot pick if in spawn mode
+                if spawn_mode == "start_lot" and lots:
+                    lot_id = screen_to_lot(event.pos[0], event.pos[1], city, x_min, x_max, y_min, y_max, w, h)
+                    if lot_id:
+                        spawn_state[0] = "end_lot"
+                        spawn_state[1] = lot_id
+                elif spawn_mode == "end_lot" and lots:
+                    lot_id = screen_to_lot(event.pos[0], event.pos[1], city, x_min, x_max, y_min, y_max, w, h)
+                    if lot_id and lot_id != start_lot:
+                        # Spawn new car and only add to procs if server actually registers it
+                        n = len(procs) + 1
+                        license_id = f"CAR{n:03d}"
+                        port = 9000 + n
+                        p = spawn_car(license_id, port, start_lot, lot_id)
+                        spawn_state[0] = None
+                        spawn_state[1] = None
+                        # Wait for server to have the car (registration can take a moment)
+                        time.sleep(2.5)
+                        result = fetch_car_positions()
+                        registered = isinstance(result, list) and any(lic == license_id for lic, _x, _y in result)
+                        if registered:
+                            procs.append((license_id, port, p))
+                            print(f"Spawned {license_id}: {start_lot} -> {lot_id}", flush=True)
+                        else:
+                            try:
+                                p.terminate()
+                            except Exception:
+                                pass
+                            print(f"Registration failed for {license_id} ({start_lot} -> {lot_id}). No path? Restart server after city.json changes.", flush=True)
 
         now = pygame.time.get_ticks()
         if now - last_poll > POLL_INTERVAL_MS:
@@ -223,7 +305,7 @@ def run_viz(proc):
                 p2 = to_screen(pts[i + 1][0], pts[i + 1][1], x_min, x_max, y_min, y_max, w, h)
                 pygame.draw.line(screen, ROAD_COLOR, p1, p2, ROAD_WIDTH)
 
-        for lot_id, lot in city.get("parking_lots", {}).items():
+        for lot_id, lot in lots.items():
             cx, cy = lot.get("center", [0, 0])
             size = lot.get("size", [40, 40])
             if isinstance(size, (list, tuple)) and len(size) >= 2:
@@ -250,9 +332,17 @@ def run_viz(proc):
             label = font.render(license_id, True, color)
             screen.blit(label, (sx - label.get_width() // 2, sy - CAR_RADIUS - 18))
 
-        status = f"Car: {FROM_LOT} -> {TO_LOT}  |  {SERVER_URL}"
+        # Top-left: Spawn Car button or prompt
+        pygame.draw.rect(screen, (70, 100, 160), spawn_rect)
+        pygame.draw.rect(screen, (120, 150, 220), spawn_rect, 2)
+        lbl = font.render(spawn_btn_label, True, (255, 255, 255))
+        screen.blit(lbl, (spawn_rect.x + (spawn_rect.w - lbl.get_width()) // 2, spawn_rect.y + 4))
+
+        status = f"Cars: {len(cars)}  |  {SERVER_URL}"
         if error_msg:
             status = f"Server error: {error_msg}"
+        elif len(cars) == 0 and len(procs) > 0:
+            status = f"Cars: 0 (server has no cars; restart server after city.json changes?)  |  {SERVER_URL}"
         text = font.render(status, True, TEXT_COLOR)
         screen.blit(text, (10, h - 32))
 
@@ -269,23 +359,20 @@ def run_viz(proc):
 
 
 def main():
-    print("HiveMind demo - one car A -> B")
+    print("HiveMind demo - Spawn Car (top left), then click start lot, then end lot. Reset removes all cars.")
     print("Checking server...")
     if not wait_for_server():
         print("ERROR: Server not running. Start it first:")
         print("  cd hive_mind_server")
         print("  cargo run")
         sys.exit(1)
-    print("Server OK. Spawning car CAR001 A -> B...")
-    proc = spawn_car()
-    time.sleep(1)
+    print("Server OK.")
+    procs = []  # list of (license, port, Popen)
+    spawn_state = [None, None]  # [mode, start_lot]
     try:
-        run_viz(proc)
+        run_viz(procs, spawn_state)
     finally:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+        remove_all_cars(procs)
 
 
 if __name__ == "__main__":

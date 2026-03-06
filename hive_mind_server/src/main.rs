@@ -23,10 +23,9 @@ use map::{CityGraph, CityMap, ParkingLotSpawns};
 use pathfinding::{compute_path, Waypoint};
 
 const DEFAULT_SPEED: f64 = 75.0;
-const CITY_MAP_PATH: &str = "../city.json";
 const BIND_ADDR: &str = "0.0.0.0:8080";
-const WAYPOINT_PROXIMITY: f64 = 30.0;
-const MIN_PROGRESS_FROM_WP: f64 = 15.0;
+const WAYPOINT_PROXIMITY: f64 = 60.0;  // distance at which car is considered "at" a waypoint (or destination)
+const MIN_PROGRESS_FROM_WP: f64 = 10.0;
 const POLL_INTERVAL_SECS: f64 = 0.5;
 const ENTRANCE_PROXIMITY: f64 = 5.0;
 
@@ -468,6 +467,16 @@ async fn health() -> HttpResponse {
     HttpResponse::Ok().content_type("text/plain").body("OK")
 }
 
+/// `POST /remove-all-cars` – clear all registered cars and routes (stops tracking; call before killing car processes).
+async fn remove_all_cars(state: web::Data<Arc<AppState>>) -> HttpResponse {
+    state.cars.lock().unwrap().clear();
+    state.registered_routes.lock().unwrap().clear();
+    println!("All cars removed");
+    HttpResponse::Ok()
+        .content_type("text/plain")
+        .body("ok")
+}
+
 /// `POST /reset-car` – restart all cars (or a subset) from their original spawn positions.
 async fn reset_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResponse {
     // Gets the licenses from the body
@@ -516,11 +525,27 @@ async fn reset_car(state: web::Data<Arc<AppState>>, body: String) -> HttpRespons
         .body("ok")
 }
 
+/// Resolve city.json path: prefer same dir as exe (go up from target/debug to hive_mind_server, then ../city.json).
+fn city_map_path() -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        // exe is typically .../hive_mind_server/target/debug/hive_mind_server.exe
+        if let Some(base) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+            let path = base.join("..").join("city.json");
+            if path.exists() {
+                return path.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "../city.json".to_string()
+}
+
 /// Server entrypoint: load initial city, build graph, create shared state and bind all routes.
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    let city_path = city_map_path();
+    eprintln!("Loading city from: {}", city_path);
     // Loads the city map from the path
-    let city_map = CityMap::load(CITY_MAP_PATH).unwrap_or_else(|e| {
+    let city_map = CityMap::load(&city_path).unwrap_or_else(|e| {
         eprintln!("Error loading city: {}", e);
         std::process::exit(1);
     });
@@ -560,6 +585,7 @@ async fn main() -> std::io::Result<()> {
             .route("/parking-lots", web::get().to(parking_lots))
             .route("/health", web::get().to(health))
             .route("/reset-car", web::post().to(reset_car))
+            .route("/remove-all-cars", web::post().to(remove_all_cars))
     })
     // Binds the server to the address
     .bind(BIND_ADDR)?

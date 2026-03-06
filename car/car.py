@@ -25,8 +25,8 @@ goal_x = None
 goal_y = None
 _state = "at_center"
 
-MAP_X_MIN, MAP_X_MAX = -500, 1500
-MAP_Y_MIN, MAP_Y_MAX = -600, 600
+MAP_X_MIN, MAP_X_MAX = -1500, 1500
+MAP_Y_MIN, MAP_Y_MAX = -1500, 1500
 ARRIVAL_DIST = 5.0
 LOT_SPEED = 50.0
 
@@ -63,7 +63,11 @@ def sim_loop():
             y += dir_y * speed * dt
         if goal_x is not None and goal_y is not None:
             dist = math.hypot(x - goal_x, y - goal_y)
-            if dist <= ARRIVAL_DIST:
+            # Stop when within range, or when we've overshot (passed the goal along our direction)
+            dx_to_goal = goal_x - x
+            dy_to_goal = goal_y - y
+            overshot = (dx_to_goal * dir_x + dy_to_goal * dir_y) <= 0  # moving away from goal
+            if dist <= ARRIVAL_DIST or (overshot and _state == "to_dest_center"):
                 if _state == "to_entrance":
                     _state = "waiting_entrance"
                     speed = 0.0
@@ -191,8 +195,13 @@ def main():
     license = args.license
     goal_x = None
     goal_y = None
-    lot_centers = {"A": (900, -500), "B": (-300, 500), "C": (200, -220)}
-    x, y = lot_centers.get(args.from_lot, (0, 0))
+    # Match city.json lot centers (A–I on spurs only; J removed)
+    lot_centers = {
+        "A": (-1100.0, 600.0), "B": (-1100.0, 800.0), "C": (-400.0, -50.0), "D": (-800.0, 50.0),
+        "E": (-300.0, -650.0), "F": (750.0, 1300.0), "G": (900.0, -450.0), "H": (900.0, -650.0),
+        "I": (-300.0, 450.0),
+    }
+    x, y = lot_centers.get(args.from_lot, (0.0, 0.0))
     dir_x, dir_y = 1.0, 0.0
     _state = "at_center"
 

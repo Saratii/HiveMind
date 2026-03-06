@@ -15,6 +15,7 @@ use serde::Deserialize;
 use std::fs;
 
 const NODE_EPSILON: f64 = 1.0;
+const INTERSECT_EPSILON: f64 = 1e-6;
 
 // Defines the Segment struct, which contains the points of the segment
 #[derive(Debug, Deserialize, Clone)]
@@ -119,40 +120,34 @@ impl CityMap {
         })
     }
 
-    // Builds the graph for the city map
+    // Builds the graph for the city map, splitting segments at intersections so the graph is connected.
     pub fn build_graph(&self) -> CityGraph {
-        // Initializes the nodes and edges vectors
+        // Expand each segment with intersection points from other segments
+        let expanded: Vec<Vec<[f64; 2]>> = self
+            .segments
+            .iter()
+            .map(|seg| Self::expand_segment_with_intersections(seg, &self.segments))
+            .collect();
+
         let mut nodes: Vec<GraphNode> = Vec::new();
         let mut edges: Vec<GraphEdge> = Vec::new();
-        // Defines the find_or_add function, which finds the nearest node to the given x and y coordinates
         let find_or_add = |nodes: &mut Vec<GraphNode>, x: f64, y: f64| -> usize {
-            // For each node, check if the distance between the node and the given x and y coordinates is less than the node epsilon
             for (i, n) in nodes.iter().enumerate() {
-                // If the distance is less than the node epsilon, return the index of the node
                 if (n.x - x).hypot(n.y - y) < NODE_EPSILON {
                     return i;
                 }
             }
-            // If the distance is greater than the node epsilon, add the node to the nodes vector and return the index of the node
             nodes.push(GraphNode { x, y });
             nodes.len() - 1
         };
-        // For each segment, get the points and add the edges to the edges vector
-        for seg in &self.segments {
-            // For each window in the segment, get the points and add the edges to the edges vector
-            for window in seg.pts.windows(2) {
-                // Gets the points from the window
+        for pts in &expanded {
+            for window in pts.windows(2) {
                 let [x0, y0] = window[0];
                 let [x1, y1] = window[1];
-                // Finds the nearest node to the given x and y coordinates
                 let from = find_or_add(&mut nodes, x0, y0);
-                // Finds the nearest node to the given x and y coordinates
                 let to = find_or_add(&mut nodes, x1, y1);
-                // Calculates the length of the edge
                 let length = (x1 - x0).hypot(y1 - y0);
-                // Adds the edge to the edges vector
                 edges.push(GraphEdge { from, to, length });
-                // Adds the reverse edge to the edges vector
                 edges.push(GraphEdge {
                     from: to,
                     to: from,
@@ -173,6 +168,64 @@ impl CityMap {
             edges,
             adjacency,
         }
+    }
+
+    /// Intersection of two line segments (a0,a1) and (b0,b1). Returns the point if they cross
+    /// (including at endpoints); parallel or non-crossing returns None.
+    fn segment_intersect(
+        a0: [f64; 2],
+        a1: [f64; 2],
+        b0: [f64; 2],
+        b1: [f64; 2],
+    ) -> Option<[f64; 2]> {
+        let dxa = a1[0] - a0[0];
+        let dya = a1[1] - a0[1];
+        let dxb = b1[0] - b0[0];
+        let dyb = b1[1] - b0[1];
+        let denom = dxa * dyb - dya * dxb;
+        if denom.abs() < INTERSECT_EPSILON {
+            return None;
+        }
+        let t = ((b0[0] - a0[0]) * dyb - (b0[1] - a0[1]) * dxb) / denom;
+        let s = ((b0[0] - a0[0]) * dya - (b0[1] - a0[1]) * dxa) / denom;
+        if t >= -INTERSECT_EPSILON && t <= 1.0 + INTERSECT_EPSILON
+            && s >= -INTERSECT_EPSILON && s <= 1.0 + INTERSECT_EPSILON
+        {
+            Some([a0[0] + t * dxa, a0[1] + t * dya])
+        } else {
+            None
+        }
+    }
+
+    /// Expand one segment's point list by inserting intersection points with all other segments,
+    /// so that crossing segments share a node and the graph is connected.
+    fn expand_segment_with_intersections(seg: &Segment, all_segments: &[Segment]) -> Vec<[f64; 2]> {
+        let mut result = Vec::new();
+        for (edge_idx, window) in seg.pts.windows(2).enumerate() {
+            let a0 = window[0];
+            let a1 = window[1];
+            let mut splits: Vec<(f64, [f64; 2])> = Vec::new();
+            for other in all_segments {
+                if std::ptr::eq(other, seg) {
+                    continue;
+                }
+                for ow in other.pts.windows(2) {
+                    if let Some(pt) = Self::segment_intersect(a0, a1, ow[0], ow[1]) {
+                        let d = (pt[0] - a0[0]).hypot(pt[1] - a0[1]);
+                        splits.push((d, pt));
+                    }
+                }
+            }
+            splits.sort_by(|u, v| u.0.partial_cmp(&v.0).unwrap_or(std::cmp::Ordering::Equal));
+            if edge_idx == 0 {
+                result.push(a0);
+            }
+            for (_d, pt) in splits {
+                result.push(pt);
+            }
+            result.push(a1);
+        }
+        result
     }
 }
 

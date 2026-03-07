@@ -24,10 +24,15 @@ use pathfinding::{compute_path, Waypoint};
 
 const DEFAULT_SPEED: f64 = 75.0;
 const BIND_ADDR: &str = "0.0.0.0:8080";
-const WAYPOINT_PROXIMITY: f64 = 60.0;
-const MIN_PROGRESS_FROM_WP: f64 = 10.0;
-const POLL_INTERVAL_SECS: f64 = 0.5;
-const ENTRANCE_PROXIMITY: f64 = 5.0;
+/// How close the car must be to a waypoint before we advance to the next segment (keeps cars on path).
+const WAYPOINT_PROXIMITY: f64 = 18.0;
+/// Send the next segment direction when car is this far from waypoint so it starts turning before the corner.
+const LOOKAHEAD_DISTANCE: f64 = 42.0;
+const MIN_PROGRESS_FROM_WP: f64 = 5.0;
+const POLL_INTERVAL_SECS: f64 = 0.35;
+const ENTRANCE_PROXIMITY: f64 = 8.0;
+/// Max time to wait for car to reach a waypoint before advancing anyway (avoids infinite loop if car unreachable).
+const WAYPOINT_WAIT_TIMEOUT_SECS: f64 = 90.0;
 
 /// Snapshot of a single car as tracked by the server (current URL and last-known position).
 #[derive(Clone)]
@@ -84,7 +89,8 @@ async fn get_position(client: &reqwest::Client, car_url: &str) -> Option<(f64, f
     Some((x?, y?))
 }
 
-/// Leave lot (drive to entrance, wait, enter roadway), then drive loop to dest entrance, then go to dest center.
+/// Leave lot (drive to entrance, wait, enter roadway), then drive loop: follow Dijkstra path
+/// waypoint-by-waypoint, sending set_route (direction + optional snap) at each segment until destination.
 fn run_car_trip(
     car_url: String,
     license: String,
@@ -139,8 +145,9 @@ fn run_car_trip(
         )
         .await;
 
-        for _ in 0..20 {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        // Brief wait for car to process enter_roadway and transition to on_road (avoid starting drive loop too early)
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
             if let Some((cx, cy)) = get_position(&client, &car_url).await {
                 if (cx - entrance_from.0).hypot(cy - entrance_from.1) <= ENTRANCE_PROXIMITY {
                     break;
@@ -179,11 +186,28 @@ fn start_drive_loop(
             let dx = first.x - start_x;
             let dy = first.y - start_y;
             let dist = (dx * dx + dy * dy).sqrt();
-            let (dir_x, dir_y) = if dist > 1e-9 {
-                (dx / dist, dy / dist)
+            let mut dir_x = if dist > 1e-9 {
+                dx / dist
             } else {
-                (first.dir_x, first.dir_y)
+                first.dir_x
             };
+            let mut dir_y = if dist > 1e-9 {
+                dy / dist
+            } else {
+                first.dir_y
+            };
+            // If direction is still zero (degenerate first waypoint), use direction toward next waypoint so car doesn't keep previous heading and drive off road (e.g. lot F)
+            if (dir_x * dir_x + dir_y * dir_y).sqrt() < 1e-9 {
+                if let Some(next) = path.get(1) {
+                    let nx = next.x - start_x;
+                    let ny = next.y - start_y;
+                    let d = (nx * nx + ny * ny).sqrt();
+                    if d > 1e-9 {
+                        dir_x = nx / d;
+                        dir_y = ny / d;
+                    }
+                }
+            }
             send_command(
                 &client,
                 &car_url,
@@ -213,27 +237,59 @@ fn start_drive_loop(
             if speed <= 0.0 {
                 continue;
             }
-            // Don't skip when dist_to_next is 0 (graph nodes) — we still must wait and send next direction
-            let travel_secs = wp.dist_to_next / speed;
-            let sleep_secs = (travel_secs - POLL_INTERVAL_SECS).max(0.0);
+            let target_x = wp.x;
+            let target_y = wp.y;
+            let seg_dx = target_x - prev_x;
+            let seg_dy = target_y - prev_y;
+            let seg_len = (seg_dx * seg_dx + seg_dy * seg_dy).sqrt();
+            let seg_len_sq = seg_dx * seg_dx + seg_dy * seg_dy;
+            // Sleep until we expect the car to be close to the waypoint (use segment length, not wp.dist_to_next)
+            let travel_secs = if seg_len > 1e-9 { seg_len / speed } else { 0.0 };
+            let sleep_secs = (travel_secs - POLL_INTERVAL_SECS * 2.0).max(0.0);
             tokio::time::sleep(Duration::from_secs_f64(sleep_secs)).await;
 
-            // Wait until car is near target: for last segment wait for destination (next), else wait for wp
-            let target_x = if is_last_segment { next.x } else { wp.x };
-            let target_y = if is_last_segment { next.y } else { wp.y };
-            // true = reached by being close (smooth, snap ok); false = reached by overshoot (don't snap, avoid backward warp)
+            // Direction from this wp to next (compute once so we can send it in lookahead)
+            let dx = next.x - wp.x;
+            let dy = next.y - wp.y;
+            let seg_to_next_len = (dx * dx + dy * dy).sqrt();
+            let (dir_x, dir_y) = if seg_to_next_len > 1e-9 {
+                (dx / seg_to_next_len, dy / seg_to_next_len)
+            } else {
+                (wp.dir_x, wp.dir_y)
+            };
+
+            // Wait until car is near target. Send next direction when car enters lookahead so it turns before the corner.
+            let mut direction_sent = false;
+            let mut waited_secs = 0.0_f64;
             let reached_by_proximity = loop {
                 match get_position(&client, &car_url).await {
                     Some((cx, cy)) => {
                         let dist_to_target = (cx - target_x).hypot(cy - target_y);
                         let dist_from_prev = (cx - prev_x).hypot(cy - prev_y);
-                        let seg_dx = target_x - prev_x;
-                        let seg_dy = target_y - prev_y;
-                        let seg_len_sq = seg_dx * seg_dx + seg_dy * seg_dy;
                         let overshot = seg_len_sq > 1e-9
                             && (cx - prev_x) * seg_dx + (cy - prev_y) * seg_dy >= seg_len_sq;
-                        let made_progress = dist_from_prev >= MIN_PROGRESS_FROM_WP || overshot;
+                        let made_progress = dist_from_prev >= MIN_PROGRESS_FROM_WP
+                            || overshot
+                            || dist_to_target < WAYPOINT_PROXIMITY;
                         let is_near = (dist_to_target < WAYPOINT_PROXIMITY || overshot) && made_progress;
+
+                        // Send next segment direction as soon as car is within lookahead so it starts turning before the corner
+                        if !direction_sent && dist_to_target < LOOKAHEAD_DISTANCE {
+                            let params: Vec<(&str, String)> = vec![
+                                ("type", "set_route".into()),
+                                ("license", license.clone()),
+                                ("speed", format!("{:.2}", speed)),
+                                ("direction_x", format!("{:.4}", dir_x)),
+                                ("direction_y", format!("{:.4}", dir_y)),
+                            ];
+                            let params_ref: Vec<(&str, &str)> = params
+                                .iter()
+                                .map(|(k, v)| (*k, v.as_str()))
+                                .collect();
+                            send_command(&client, &car_url, &params_ref).await;
+                            direction_sent = true;
+                        }
+
                         if let Ok(mut map) = state.cars.lock() {
                             if let Some(c) = map.get_mut(&license) {
                                 c.x = cx;
@@ -247,8 +303,63 @@ fn start_drive_loop(
                     None => {}
                 }
                 tokio::time::sleep(Duration::from_secs_f64(POLL_INTERVAL_SECS)).await;
+                waited_secs += POLL_INTERVAL_SECS;
+                if waited_secs >= WAYPOINT_WAIT_TIMEOUT_SECS {
+                    eprintln!("Car {} waypoint timeout, advancing", license);
+                    break false;
+                }
             };
+            let _ = reached_by_proximity;
+
+            // If we never sent (e.g. short segment or timeout), send direction now so next iteration has correct heading
+            if !direction_sent {
+                let params: Vec<(&str, String)> = vec![
+                    ("type", "set_route".into()),
+                    ("license", license.clone()),
+                    ("speed", format!("{:.2}", speed)),
+                    ("direction_x", format!("{:.4}", dir_x)),
+                    ("direction_y", format!("{:.4}", dir_y)),
+                ];
+                let params_ref: Vec<(&str, &str)> = params
+                    .iter()
+                    .map(|(k, v)| (*k, v.as_str()))
+                    .collect();
+                send_command(&client, &car_url, &params_ref).await;
+            }
+
             if is_last_segment {
+                // Car now has direction toward last waypoint; wait until we reach it, then drive to lot center
+                let last_x = next.x;
+                let last_y = next.y;
+                let last_seg_dx = last_x - wp.x;
+                let last_seg_dy = last_y - wp.y;
+                let last_seg_len_sq = last_seg_dx * last_seg_dx + last_seg_dy * last_seg_dy;
+                let mut waited_secs = 0.0_f64;
+                loop {
+                    match get_position(&client, &car_url).await {
+                        Some((cx, cy)) => {
+                            let dist_to_last = (cx - last_x).hypot(cy - last_y);
+                            let overshot = last_seg_len_sq > 1e-9
+                                && (cx - wp.x) * last_seg_dx + (cy - wp.y) * last_seg_dy >= last_seg_len_sq;
+                            if let Ok(mut map) = state.cars.lock() {
+                                if let Some(c) = map.get_mut(&license) {
+                                    c.x = cx;
+                                    c.y = cy;
+                                }
+                            }
+                            if dist_to_last < WAYPOINT_PROXIMITY || overshot {
+                                break;
+                            }
+                        }
+                        None => {}
+                    }
+                    tokio::time::sleep(Duration::from_secs_f64(POLL_INTERVAL_SECS)).await;
+                    waited_secs += POLL_INTERVAL_SECS;
+                    if waited_secs >= WAYPOINT_WAIT_TIMEOUT_SECS {
+                        eprintln!("Car {} last waypoint timeout, advancing to lot", license);
+                        break;
+                    }
+                }
                 if let Some((cx, cy)) = dest_center {
                     send_command(
                         &client,
@@ -267,33 +378,6 @@ fn start_drive_loop(
                 }
                 break;
             }
-
-            // Direction from this wp to next (wp.dir_x/dir_y can be 0 at graph nodes, so always compute)
-            let dx = next.x - wp.x;
-            let dy = next.y - wp.y;
-            let dist = (dx * dx + dy * dy).sqrt();
-            let (dir_x, dir_y) = if dist > 1e-9 {
-                (dx / dist, dy / dist)
-            } else {
-                (wp.dir_x, wp.dir_y)
-            };
-            // Only snap to waypoint when we reached it by proximity; if we overshot, don't warp car backward
-            let mut params: Vec<(&str, String)> = vec![
-                ("type", "set_route".into()),
-                ("license", license.clone()),
-                ("speed", format!("{:.2}", speed)),
-                ("direction_x", format!("{:.4}", dir_x)),
-                ("direction_y", format!("{:.4}", dir_y)),
-            ];
-            if reached_by_proximity {
-                params.push(("pos_x", format!("{:.2}", wp.x)));
-                params.push(("pos_y", format!("{:.2}", wp.y)));
-            }
-            let params_ref: Vec<(&str, &str)> = params
-                .iter()
-                .map(|(k, v)| (*k, v.as_str()))
-                .collect();
-            send_command(&client, &car_url, &params_ref).await;
         }
     });
 }

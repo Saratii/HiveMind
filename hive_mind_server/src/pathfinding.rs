@@ -105,7 +105,9 @@ fn dijkstra(graph: &CityGraph, start: usize, goal: usize) -> Option<Vec<usize>> 
     Some(path)
 }
 
-// Defines the compute_path function, which computes the path between two points on the city graph
+/// Computes a drivable path from (start_x, start_y) to (dest_x, dest_y) using Dijkstra's algorithm
+/// on the city graph. Returns a list of waypoints along the shortest path; the server uses these
+/// to send direction updates so the car follows the path and turns at each segment.
 pub fn compute_path(
     graph: &CityGraph,
     start_x: f64,
@@ -113,7 +115,6 @@ pub fn compute_path(
     dest_x: f64,
     dest_y: f64,
 ) -> Option<Vec<Waypoint>> {
-    // Finds the nearest node to the start and goal points
     let start_node = graph.nearest_node(start_x, start_y);
     let goal_node = graph.nearest_node(dest_x, dest_y);
     let node_path = dijkstra(graph, start_node, goal_node)?;
@@ -121,18 +122,21 @@ pub fn compute_path(
     if node_path.len() < 2 {
         return None;
     }
-    // Initializes the waypoints vector
-    const STEP_M: f64 = 20.0;
+    // Smaller step = more waypoints = tighter to the road and smoother turns
+    const STEP_M: f64 = 5.0;
     let mut waypoints = Vec::new();
-    // For each node in the path, calculate the waypoints
+    // For each node in the path, calculate the waypoints (skip zero-length edges so we never emit dir 0,0)
     for i in 0..node_path.len() - 1 {
         let a = &graph.nodes[node_path[i]];
         let b = &graph.nodes[node_path[i + 1]];
         let dx = b.x - a.x;
         let dy = b.y - a.y;
         let dist = dx.hypot(dy);
-        let dir_x = if dist > 1e-9 { dx / dist } else { 0.0 };
-        let dir_y = if dist > 1e-9 { dy / dist } else { 0.0 };
+        if dist < 1e-9 {
+            continue;
+        }
+        let dir_x = dx / dist;
+        let dir_y = dy / dist;
         let mut d = 0.0;
         // While the distance is less than the distance to the next node, calculate the waypoints
         while d < dist - 1e-6 {

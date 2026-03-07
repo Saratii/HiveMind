@@ -146,7 +146,14 @@ impl CityMap {
                 let [x1, y1] = window[1];
                 let from = find_or_add(&mut nodes, x0, y0);
                 let to = find_or_add(&mut nodes, x1, y1);
+                // Skip zero-length edges (e.g. duplicate points in L-shaped segments like F's spur)
+                if from == to {
+                    continue;
+                }
                 let length = (x1 - x0).hypot(y1 - y0);
+                if length < 1e-9 {
+                    continue;
+                }
                 edges.push(GraphEdge { from, to, length });
                 edges.push(GraphEdge {
                     from: to,

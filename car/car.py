@@ -18,6 +18,9 @@ x = 0.0
 y = 0.0
 dir_x = 1.0
 dir_y = 0.0
+# Target direction for smooth steering (interpolated toward in sim_loop)
+target_dir_x = 1.0
+target_dir_y = 0.0
 speed = 0.0
 license = "CAR001"
 run = True
@@ -29,6 +32,8 @@ MAP_X_MIN, MAP_X_MAX = -1500, 1500
 MAP_Y_MIN, MAP_Y_MAX = -1500, 1500
 ARRIVAL_DIST = 5.0
 LOT_SPEED = 50.0
+# Max turn rate in radians per second — higher = tighter turns, stays on road better
+TURN_RATE_RAD_PER_SEC = 5.0
 
 
 def clear_goal():
@@ -38,7 +43,7 @@ def clear_goal():
 
 
 def set_goal(gx: float, gy: float):
-    global goal_x, goal_y, dir_x, dir_y, speed
+    global goal_x, goal_y, dir_x, dir_y, target_dir_x, target_dir_y, speed
     goal_x = gx
     goal_y = gy
     dx = gx - x
@@ -47,27 +52,51 @@ def set_goal(gx: float, gy: float):
     if dist > 1e-9:
         dir_x = dx / dist
         dir_y = dy / dist
+        target_dir_x = dir_x
+        target_dir_y = dir_y
     speed = LOT_SPEED
 
 
 def sim_loop():
-    global x, y, _state, speed, goal_x, goal_y
+    global x, y, dir_x, dir_y, target_dir_x, target_dir_y, _state, speed, goal_x, goal_y
     last = time.monotonic()
     while run:
         time.sleep(0.05)
         now = time.monotonic()
         dt = now - last
         last = now
+        # Smooth steering when on road (no goal): interpolate direction toward target
+        if goal_x is None and goal_y is None and speed > 0.001:
+            dot = dir_x * target_dir_x + dir_y * target_dir_y
+            # Clamp dot for acos (can drift slightly past 1/-1)
+            dot = max(-1.0, min(1.0, dot))
+            angle = math.acos(dot)
+            max_angle = TURN_RATE_RAD_PER_SEC * dt
+            if angle > 1e-6:
+                t = 1.0 if max_angle >= angle else max_angle / angle
+                # Slerp: dir = dir * (1-t) + target * t, then normalize
+                nx = dir_x * (1 - t) + target_dir_x * t
+                ny = dir_y * (1 - t) + target_dir_y * t
+                mag = math.hypot(nx, ny)
+                if mag > 1e-9:
+                    dir_x = nx / mag
+                    dir_y = ny / mag
         if speed > 0.001:
             x += dir_x * speed * dt
             y += dir_y * speed * dt
+            # Clamp to map bounds so car never drives off
+            x = max(MAP_X_MIN, min(MAP_X_MAX, x))
+            y = max(MAP_Y_MIN, min(MAP_Y_MAX, y))
         if goal_x is not None and goal_y is not None:
             dist = math.hypot(x - goal_x, y - goal_y)
-            # Stop when within range, or when we've overshot (passed the goal along our direction)
             dx_to_goal = goal_x - x
             dy_to_goal = goal_y - y
             overshot = (dx_to_goal * dir_x + dy_to_goal * dir_y) <= 0  # moving away from goal
-            if dist <= ARRIVAL_DIST or (overshot and _state == "to_dest_center"):
+            # Arrive: within distance, or overshot (and for entrance/road also allow if we're still close)
+            arrived = dist <= ARRIVAL_DIST
+            arrived = arrived or (overshot and _state == "to_dest_center")
+            arrived = arrived or (overshot and _state in ("to_entrance", "to_road") and dist <= ARRIVAL_DIST * 3)
+            if arrived:
                 if _state == "to_entrance":
                     _state = "waiting_entrance"
                     speed = 0.0
@@ -100,7 +129,7 @@ class CarHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
-        global x, y, dir_x, dir_y, speed, _state, goal_x, goal_y
+        global x, y, dir_x, dir_y, target_dir_x, target_dir_y, speed, _state, goal_x, goal_y
         if self.path == "/command":
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length).decode() if length else ""
@@ -144,8 +173,11 @@ class CarHandler(BaseHTTPRequestHandler):
                     dy = float(get("direction_y", "0"))
                     mag = math.hypot(dx, dy)
                     if mag > 1e-9:
-                        dir_x = dx / mag
-                        dir_y = dy / mag
+                        tx, ty = dx / mag, dy / mag
+                        target_dir_x = tx
+                        target_dir_y = ty
+                        # Apply new direction immediately so we follow the path (turn at each waypoint)
+                        dir_x, dir_y = tx, ty
                     clear_goal()
                     _state = "on_road"
                     if "pos_x" in params and "pos_y" in params:

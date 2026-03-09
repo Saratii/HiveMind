@@ -123,13 +123,14 @@ async fn get_car_position(client: &reqwest::Client, car_url: &str) -> Option<(f6
 }
 
 //drive loop, sending commands to the car to follow the path of waypoints and polling its position to adjust timing
-//inputs: car URL, car license plate, path of waypoints, speed to drive
+//inputs: car URL, car license plate, path of waypoints, speed to drive, shared app state for eviction on arrival
 //returns: None
 fn start_drive_loop(
     car_url: String,
     license: String,
     path: Vec<pathfinding::Waypoint>,
     speed: f64,
+    state: Arc<AppState>,
 ) {
     tokio::spawn(async move {
         let client = reqwest::Client::new();
@@ -192,6 +193,8 @@ fn start_drive_loop(
                     &[("type", "stop"), ("license", &license)],
                 )
                 .await;
+                state.cars.lock().unwrap().retain(|c| c.license != license);
+                println!("Car {} evicted from registry", license);
                 break;
             }
             let speed_str = format!("{:.2}", speed);
@@ -287,7 +290,13 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
     }
     state.cars.lock().unwrap().push(car.clone());
     println!("Car {} validated, starting drive loop", car.license);
-    start_drive_loop(url.clone(), license.clone(), path, speed);
+    start_drive_loop(
+        url.clone(),
+        license.clone(),
+        path,
+        speed,
+        Arc::clone(&state),
+    );
     forward_car(license.clone(), url.clone());
     HttpResponse::Ok()
         .content_type("text/plain")

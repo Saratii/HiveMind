@@ -1,40 +1,45 @@
 /*
 prologue
 Name of program: map.rs
-Description: Loads a city map from JSON and constructs a graph representation for pathfinding.
+Description: Loads a city map from the node-based JSON format and constructs a graph
+             representation for pathfinding.
 Author: Maren Proplesch
 Date Created: 3/1/2026
-Date Revised: 3/1/2026
-Revision History: Included in the numerous sprint artifacts.
-Preconditions: Not applicable/Redundant
-Postconditions: Not applicable/Redundant
+Date Revised: 3/13/2026
 */
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 
-pub const ENDPOINT_EPSILON: f64 = 1.0;
-
-//struct for a line segment in the city map, defined by a list of points
 #[derive(Debug, Deserialize, Clone)]
-pub struct Segment {
-    pub pts: Vec<[f64; 2]>,
+struct RawNode {
+    pub x: f64,
+    pub y: f64,
+    pub connects: Vec<String>,
 }
 
-//struct for the city map, containing a list of segments
-#[derive(Debug, Clone)]
-pub struct CityMap {
-    pub segments: Vec<Segment>,
+#[derive(Debug, Deserialize, Clone)]
+struct RawPortal {
+    pub x: f64,
+    pub y: f64,
+    pub connects: Vec<String>,
 }
 
-//struct for a graph node with coordinates
+#[derive(Debug, Deserialize)]
+struct RawMap {
+    pub intersections: HashMap<String, RawNode>,
+    pub endpoints: HashMap<String, RawNode>,
+    pub parking_portals: HashMap<String, RawPortal>,
+}
+
 #[derive(Debug, Clone)]
 pub struct GraphNode {
     pub x: f64,
     pub y: f64,
+    pub id: String,
 }
 
-//struct for a graph edge connecting two nodes with a length
 #[derive(Debug, Clone)]
 pub struct GraphEdge {
     pub from: usize,
@@ -42,7 +47,6 @@ pub struct GraphEdge {
     pub length: f64,
 }
 
-//struct for the city graph, containing nodes, edges, and an adjacency list
 #[derive(Debug, Clone)]
 pub struct CityGraph {
     pub nodes: Vec<GraphNode>,
@@ -50,68 +54,109 @@ pub struct CityGraph {
     pub adjacency: Vec<Vec<usize>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CityMap {
+    nodes: Vec<GraphNode>,
+    connections: Vec<(usize, usize)>,
+}
+
 impl CityMap {
-    // Load a city map from a JSON file at the given path
-    //inputs: file path to JSON map
-    //returns Ok(CityMap) or Err(error message)
     pub fn load(path: &str) -> Result<Self, String> {
         let data = fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read city map from '{}': {}", path, e))?;
-        #[derive(Deserialize)]
-        struct RawMap {
-            segments: Vec<Segment>,
-        }
+            .map_err(|e| format!("Failed to read city map '{}': {}", path, e))?;
         let raw: RawMap = serde_json::from_str(&data)
             .map_err(|e| format!("Failed to parse city map JSON: {}", e))?;
-        Ok(CityMap {
-            segments: raw.segments,
-        })
-    }
-
-    // Get the total number of segments in the city map
-    pub fn segment_count(&self) -> usize {
-        self.segments.len()
-    }
-
-    // Build a graph representation of the city map for pathfinding
-    //inputs: self (CityMap)
-    //returns CityGraph with nodes, edges, and adjacency list
-    pub fn build_graph(&self) -> CityGraph {
+        let mut id_to_index: HashMap<String, usize> = HashMap::new();
         let mut nodes: Vec<GraphNode> = Vec::new();
-        let mut edges: Vec<GraphEdge> = Vec::new();
-        let find_or_add = |nodes: &mut Vec<GraphNode>, x: f64, y: f64| -> usize {
-            for (i, n) in nodes.iter().enumerate() {
-                if (n.x - x).hypot(n.y - y) < ENDPOINT_EPSILON {
-                    return i;
-                }
-            }
-            nodes.push(GraphNode { x, y });
-            nodes.len() - 1
+        let mut push = |id: String, x: f64, y: f64| {
+            id_to_index.insert(id.clone(), nodes.len());
+            nodes.push(GraphNode { x, y, id });
         };
-        for seg in &self.segments {
-            if seg.pts.len() < 2 {
-                continue;
-            }
-            for window in seg.pts.windows(2) {
-                let [x0, y0] = window[0];
-                let [x1, y1] = window[1];
-                let from = find_or_add(&mut nodes, x0, y0);
-                let to = find_or_add(&mut nodes, x1, y1);
-                let length = (x1 - x0).hypot(y1 - y0);
-                edges.push(GraphEdge { from, to, length });
-                edges.push(GraphEdge {
-                    from: to,
-                    to: from,
-                    length,
-                });
+        let mut sorted_keys: Vec<String> = raw.intersections.keys().cloned().collect();
+        sorted_keys.sort();
+        for k in &sorted_keys {
+            let n = &raw.intersections[k];
+            push(k.clone(), n.x, n.y);
+        }
+        let mut sorted_keys: Vec<String> = raw.endpoints.keys().cloned().collect();
+        sorted_keys.sort();
+        for k in &sorted_keys {
+            let n = &raw.endpoints[k];
+            push(k.clone(), n.x, n.y);
+        }
+        let mut sorted_keys: Vec<String> = raw.parking_portals.keys().cloned().collect();
+        sorted_keys.sort();
+        for k in &sorted_keys {
+            let p = &raw.parking_portals[k];
+            push(k.clone(), p.x, p.y);
+        }
+        let mut connection_set: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
+        let collect_connects =
+            |id: &str, connects: &[String], id_to_index: &HashMap<String, usize>| {
+                let from = match id_to_index.get(id) {
+                    Some(&i) => i,
+                    None => return Vec::new(),
+                };
+                connects
+                    .iter()
+                    .filter_map(|nb_id| {
+                        id_to_index.get(nb_id).map(
+                            |&to| {
+                                if from < to { (from, to) } else { (to, from) }
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+        for (id, node) in &raw.intersections {
+            for pair in collect_connects(id, &node.connects, &id_to_index) {
+                connection_set.insert(pair);
             }
         }
-        let mut adjacency = vec![Vec::new(); nodes.len()];
+        for (id, node) in &raw.endpoints {
+            for pair in collect_connects(id, &node.connects, &id_to_index) {
+                connection_set.insert(pair);
+            }
+        }
+        for (id, portal) in &raw.parking_portals {
+            for pair in collect_connects(id, &portal.connects, &id_to_index) {
+                connection_set.insert(pair);
+            }
+        }
+        let connections: Vec<(usize, usize)> = {
+            let mut v: Vec<_> = connection_set.into_iter().collect();
+            v.sort();
+            v
+        };
+
+        Ok(CityMap { nodes, connections })
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn build_graph(&self) -> CityGraph {
+        let n = self.nodes.len();
+        let mut edges: Vec<GraphEdge> = Vec::new();
+        for &(from, to) in &self.connections {
+            let a = &self.nodes[from];
+            let b = &self.nodes[to];
+            let length = (b.x - a.x).hypot(b.y - a.y);
+            edges.push(GraphEdge { from, to, length });
+            edges.push(GraphEdge {
+                from: to,
+                to: from,
+                length,
+            });
+        }
+        let mut adjacency = vec![Vec::new(); n];
         for (i, edge) in edges.iter().enumerate() {
             adjacency[edge.from].push(i);
         }
         CityGraph {
-            nodes,
+            nodes: self.nodes.clone(),
             edges,
             adjacency,
         }
@@ -119,47 +164,61 @@ impl CityMap {
 }
 
 impl CityGraph {
-    // Find the index of the nearest graph node to the given coordinates
-    //inputs: x and y coordinates
-    //returns index of nearest node in the graph
-    pub fn nearest_node(&self, x: f64, y: f64) -> usize {
-        self.nodes
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                (a.x - x)
-                    .hypot(a.y - y)
-                    .partial_cmp(&(b.x - x).hypot(b.y - y))
-                    .unwrap()
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+    pub fn node_index(&self, id: &str) -> Option<usize> {
+        self.nodes.iter().position(|n| n.id == id)
     }
 }
 
-//tests
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Point;
     use crate::pathfinding::compute_path;
 
+    fn load() -> CityGraph {
+        CityMap::load("../city.json")
+            .expect("city.json must be present")
+            .build_graph()
+    }
+
     #[test]
-    fn test_path_from_json_map() {
-        let map = CityMap::load("../city.json").expect("should load city map JSON");
-        let graph = map.build_graph();
-        let start = Point { x: 0.0, y: -1200.0 };
-        let dest = Point { x: 0.0, y: 1200.0 };
+    fn test_graph_loads_and_has_nodes() {
+        let g = load();
+        assert!(g.nodes.len() >= 2, "graph must have at least 2 nodes");
+        assert!(!g.edges.is_empty(), "graph must have edges");
+    }
+
+    #[test]
+    fn test_parking_lot_exits_are_routable() {
+        let g = load();
         let path =
-            compute_path(&graph, &start, &dest).expect("should find path between two map nodes");
+            compute_path(&g, "PA", "PB").expect("should find path between parking lot exits");
         assert!(path.len() >= 2);
-        assert!((path.first().unwrap().x - start.x).abs() < 1.0);
-        assert!((path.first().unwrap().y - start.y).abs() < 1.0);
-        assert!((path.last().unwrap().x - dest.x).abs() < 1.0);
-        assert!((path.last().unwrap().y - dest.y).abs() < 1.0);
-        let last = path.last().unwrap();
-        assert_eq!(last.dir_x, 0.0);
-        assert_eq!(last.dir_y, 0.0);
-        assert_eq!(last.dist_to_next, 0.0);
+        assert_eq!(path.first().unwrap().node_id, "PA");
+        assert_eq!(path.last().unwrap().node_id, "PB");
+    }
+
+    #[test]
+    fn test_graph_is_connected() {
+        use std::collections::{HashSet, VecDeque};
+        let g = load();
+        let mut seen = HashSet::new();
+        let mut q = VecDeque::new();
+        q.push_back(0usize);
+        seen.insert(0usize);
+        while let Some(u) = q.pop_front() {
+            for &ei in &g.adjacency[u] {
+                let v = g.edges[ei].to;
+                if seen.insert(v) {
+                    q.push_back(v);
+                }
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            g.nodes.len(),
+            "graph must be fully connected; only {}/{} nodes reachable from node 0",
+            seen.len(),
+            g.nodes.len()
+        );
     }
 }

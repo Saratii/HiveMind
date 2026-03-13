@@ -1,0 +1,10 @@
+[package]
+name = "simulation_viewer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = "0.18.1"
+bevy_mesh = "0.18.1"
+ureq = "3.2.0"
+iyes_perf_ui = { git = "https://github.com/Saratii/iyes_perf_ui", branch = "bevy-0.17" }

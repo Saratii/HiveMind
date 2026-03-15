@@ -1,11 +1,11 @@
 /*
 prologue
 Name of program: pathfinding.rs
-Description: Implements Dijkstra's algorithm to compute a path of waypoints from a start point to a destination point on the city graph.
+Description: Handles logic for path finding and traversing the city graph.
 Author: Maren Proplesch
-Date Created: 3/1/2026
+Date Created: 2/11/2026
 Date Revised: 3/13/2026
-Revision History: None
+Revision History: Included in the numerous sprint artifacts.
 Preconditions: Not applicable/Redundant
 Postconditions: Not applicable/Redundant
 */
@@ -15,17 +15,23 @@ use std::collections::BinaryHeap;
 
 use crate::map::CityGraph;
 
+// A single stop along a computed route, identified by the node's string ID
+// node_id: the string identifier of the graph node at this position in the path
 #[derive(Debug, Clone)]
 pub struct Waypoint {
     pub node_id: String,
 }
 
+// A priority queue entry used internally by Dijkstra's algorithm to track the cheapest known cost to reach a node
+// cost: the total accumulated edge length to reach this node from the start
+// node: the index of the node in the graph's nodes vector
 #[derive(Copy, Clone)]
 struct State {
     cost: f64,
     node: usize,
 }
 
+// Orders State entries in reverse so that the BinaryHeap behaves as a min-heap on cost
 impl Ord for State {
     fn cmp(&self, other: &Self) -> Ordering {
         other
@@ -46,6 +52,9 @@ impl PartialEq for State {
 }
 impl Eq for State {}
 
+// Runs Dijkstra's shortest path algorithm on the city graph from a start node to a goal node, returning the sequence of node indices that form the optimal route
+// Input: graph: &CityGraph containing the nodes, edges, and adjacency list; start: usize index of the origin node; goal: usize index of the destination node
+// Returns: Option<Vec<usize>> with the ordered list of node indices along the shortest path, or None if the goal is unreachable from the start
 fn dijkstra(graph: &CityGraph, start: usize, goal: usize) -> Option<Vec<usize>> {
     let n = graph.nodes.len();
     let mut dist = vec![f64::INFINITY; n];
@@ -89,6 +98,9 @@ fn dijkstra(graph: &CityGraph, start: usize, goal: usize) -> Option<Vec<usize>> 
     Some(path)
 }
 
+// Resolves string node IDs to graph indices, runs Dijkstra's algorithm, and converts the resulting index path into an ordered list of named Waypoints
+// Input: graph: &CityGraph to search; start_id: &str string identifier of the origin node; dest_id: &str string identifier of the destination node
+// Returns: Option<Vec<Waypoint>> with the ordered waypoints from start to destination, or None if either ID is not found or no path exists between them
 pub fn compute_path(graph: &CityGraph, start_id: &str, dest_id: &str) -> Option<Vec<Waypoint>> {
     let start_node = graph.node_index(start_id)?;
     let goal_node = graph.node_index(dest_id)?;
@@ -111,6 +123,9 @@ mod tests {
     use super::*;
     use crate::map::{CityGraph, GraphEdge, GraphNode};
 
+    // Constructs a small four-node test graph with bidirectional edges for use across the pathfinding unit tests
+    // Input: none
+    // Returns: CityGraph with nodes N00 through N03 arranged in a simple branching layout
     fn build_test_graph() -> CityGraph {
         let nodes = vec![
             GraphNode {
@@ -177,6 +192,9 @@ mod tests {
         }
     }
 
+    // Verifies that a path through two intermediate hops is computed correctly and that all three waypoints appear in the right order
+    // Input: none
+    // Returns: none, panics if the path length or node IDs do not match expectations
     #[test]
     fn test_direct_path() {
         let graph = build_test_graph();
@@ -187,6 +205,9 @@ mod tests {
         assert_eq!(path[2].node_id, "N02");
     }
 
+    // Verifies that the pathfinder correctly routes through a shared intermediate node when the destination branches off the main corridor
+    // Input: none
+    // Returns: none, panics if the path length or node IDs do not match expectations
     #[test]
     fn test_path_with_turn() {
         let graph = build_test_graph();
@@ -197,6 +218,9 @@ mod tests {
         assert_eq!(path[2].node_id, "N03");
     }
 
+    // Confirms that compute_path returns None when the destination node exists in the graph but has no edges connecting it to the start
+    // Input: none
+    // Returns: none, panics if a path is unexpectedly returned
     #[test]
     fn test_unreachable_returns_none() {
         let graph = CityGraph {
@@ -218,6 +242,9 @@ mod tests {
         assert!(compute_path(&graph, "N00", "N01").is_none());
     }
 
+    // Confirms that compute_path returns None when the destination ID does not exist anywhere in the graph
+    // Input: none
+    // Returns: none, panics if a path is unexpectedly returned
     #[test]
     fn test_unknown_id_returns_none() {
         let graph = build_test_graph();

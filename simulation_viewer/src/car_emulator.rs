@@ -1,3 +1,15 @@
+/*
+prologue
+Name of program: car_emulator.rs
+Description: Systems for emulating car. Updating physics of each car. Connecting to the main server.
+Author: Maren Proplesch
+Date Created: 3/13/2026
+Date Revised: 3/13/2026
+Revision History: None
+Preconditions: Not applicable/Redundant
+Postconditions: Not applicable/Redundant
+*/
+
 use bevy::prelude::*;
 use std::{
     io::{BufRead, BufReader, Write},
@@ -14,12 +26,24 @@ use crate::{
     parse_form,
 };
 
+// Tracks which stage of the pre-road entry sequence a car is currently in
 #[derive(Debug, Clone, PartialEq)]
 pub enum PreRoadPhase {
-    DrivingToWait,
-    WaitingForEntry,
+    DrivingToWait, // car is actively driving toward its designated waiting position near the road entry point
+    WaitingForEntry, // car has stopped at the wait position and is polling the server for roadway entry approval
 }
 
+// ECS component attached to a car entity while it is still in the pre-road phase, holding all the state needed to register with the server and transition onto the roadway
+// phase: which step of the pre-road sequence the car is currently executing
+// wait_target: world position the car should drive to before attempting to register
+// road_entry: world position the car will be teleported to once entry is granted
+// license: unique license plate string used to identify this car with the server
+// car_url: the HTTP callback URL the server can use to query this car's position
+// register_url: the server endpoint used to register the car and request a path
+// validate_url: the server endpoint polled to check whether entry has been approved
+// src_node_id: string ID of the graph node where the car's route begins
+// dst_node_id: string ID of the graph node where the car's route ends
+// polling_in_flight: flag indicating that a validate_entry HTTP request is currently in progress, preventing duplicate polls
 #[derive(Component)]
 pub struct PreRoad {
     pub phase: PreRoadPhase,
@@ -34,6 +58,14 @@ pub struct PreRoad {
     pub polling_in_flight: bool,
 }
 
+// Shared mutable state for a car's HTTP listener thread, including its current position, assigned waypoints, and movement parameters
+// pos_x: current world X position of the car, updated each physics frame and readable by the HTTP listener
+// pos_z: current world Z position of the car, updated each physics frame and readable by the HTTP listener
+// waypoints: ordered list of waypoints assigned by the server that the car will follow
+// wp_index: index into the waypoints list pointing to the car's next target waypoint
+// speed: target speed in world units per second that the physics system will accelerate toward
+// stopped: flag indicating that the car has reached its destination or has not yet been granted entry
+// pending_response: buffer holding the most recent raw HTTP response text from the server, consumed by the main thread each frame
 pub struct CarHttp {
     pub pos_x: f32,
     pub pos_z: f32,
@@ -45,6 +77,9 @@ pub struct CarHttp {
 }
 
 impl CarHttp {
+    // Constructs a new CarHttp instance at the given world position with all movement fields set to their stopped defaults
+    // Input: x: f32 initial world X position; z: f32 initial world Z position
+    // Returns: CarHttp with empty waypoints, zero speed, and stopped set to true
     pub fn new(x: f32, z: f32) -> Self {
         CarHttp {
             pos_x: x,
@@ -58,6 +93,11 @@ impl CarHttp {
     }
 }
 
+// ECS component holding the physics state and shared HTTP data for a car that is actively on the roadway
+// http: thread-safe shared reference to the CarHttp state, accessed by both the physics system and the HTTP listener thread
+// speed: the car's current actual speed in world units per second, smoothly adjusted toward the target speed each frame
+// dir_x: the X component of the car's current normalized movement direction
+// dir_z: the Z component of the car's current normalized movement direction
 #[derive(Component)]
 pub struct CarPhysics {
     pub http: Arc<Mutex<CarHttp>>,
@@ -66,9 +106,14 @@ pub struct CarPhysics {
     pub dir_z: f32,
 }
 
+// ECS component that stores a car entity's license plate string, used to associate path segment entities with their owning car
+// 0: the license plate string identifying which car this component belongs to
 #[derive(Component, Clone)]
 pub struct CarLicense(pub String);
 
+// Advances the physics simulation for all active roadway cars each frame, steering each car toward its next waypoint, applying acceleration, and despawning the car and its path segments when the route is complete
+// Input: commands: Commands for despawning entities; time: Res<Time> for the frame delta; q: Query over car entities with Transform, CarPhysics, and CarLicense but without PreRoad; path_segs: Query over path segment entities with CarLicense but without CarPhysics or PreRoad
+// Returns: none
 pub fn update_car_physics(
     mut commands: Commands,
     time: Res<Time>,
@@ -137,6 +182,9 @@ pub fn update_car_physics(
     }
 }
 
+// Formats a minimal HTTP response string with the given status line and plain text body
+// Input: status: &str HTTP status line such as "200 OK"; body: &str plain text response body
+// Returns: String containing a complete HTTP/1.1 response ready to write to a TCP stream
 fn http_reply(status: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -146,6 +194,9 @@ fn http_reply(status: &str, body: &str) -> String {
     )
 }
 
+// Reads a single HTTP request from a TCP stream and responds to GET /position with the car's current world coordinates, returning 404 for all other routes
+// Input: stream: TcpStream connected to the requesting client; state: Arc<Mutex<CarHttp>> providing access to the car's current position
+// Returns: none
 fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<CarHttp>>) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
@@ -203,6 +254,9 @@ fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<CarHttp>>) {
     let _ = stream.write_all(response.as_bytes());
 }
 
+// Starts a background TCP listener on the given port that handles incoming HTTP position requests for a single car by dispatching each connection to its own thread
+// Input: port: u16 the local port to bind the listener to; state: Arc<Mutex<CarHttp>> shared car state passed to each connection handler
+// Returns: none
 pub fn spawn_car_listener(port: u16, state: Arc<Mutex<CarHttp>>) {
     spawn(move || {
         let listener = match TcpListener::bind(format!("127.0.0.1:{}", port)) {
@@ -219,6 +273,9 @@ pub fn spawn_car_listener(port: u16, state: Arc<Mutex<CarHttp>>) {
     });
 }
 
+// Drives the pre-road state machine for all cars not yet on the roadway, handling both driving to the wait position and polling the server for entry approval, and removing the PreRoad component once entry is granted
+// Input: commands: Commands for removing the PreRoad component; time: Res<Time> for the frame delta; city: NonSend<CityData> for resolving waypoint coordinates; q: Query over entities with Transform, CarPhysics, and PreRoad
+// Returns: none
 pub fn pre_road_system(
     mut commands: Commands,
     time: Res<Time>,

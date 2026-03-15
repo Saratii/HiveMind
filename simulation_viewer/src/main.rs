@@ -1,3 +1,15 @@
+/*
+prologue
+Name of program: main.rs
+Description: Main file for the rendering. Sets up a bevy app with various game display elements.
+Author: Maren Proplesch
+Date Created: 3/13/2026
+Date Revised: 3/13/2026
+Revision History: None
+Preconditions: Not applicable/Redundant
+Postconditions: Not applicable/Redundant
+*/
+
 pub mod cameras;
 pub mod car_emulator;
 pub mod map_parser;
@@ -33,6 +45,11 @@ const ACCELERATION: f32 = 50.0;
 const EXIT_DRIVE_SPEED: f32 = 80.0;
 const BATCH_SPAWN_COUNT: usize = 20;
 
+// Tracks which portal the user has clicked first when selecting a source-destination pair for spawning a car
+// first: the index into the city portals list of the first selected portal, or None if no portal is currently selected
+// highlighted_entity: the ECS entity of the currently highlighted portal mesh, used to restore its material on deselection
+// next_car_id: monotonically increasing counter used to generate unique license plate strings for newly spawned cars
+// next_port: the next TCP port number to assign to a car's HTTP listener, starting at 8081 and incrementing per car
 #[derive(Resource, Default)]
 struct PortalSelection {
     first: Option<usize>,
@@ -42,6 +59,9 @@ struct PortalSelection {
 }
 
 impl PortalSelection {
+    // Constructs a PortalSelection with no active selection and counters set to their starting values
+    // Input: none
+    // Returns: PortalSelection with first and highlighted_entity set to None, next_car_id set to 1, and next_port set to 8081
     fn new() -> Self {
         Self {
             first: None,
@@ -52,15 +72,22 @@ impl PortalSelection {
     }
 }
 
+// Holds the two StandardMaterial handles used to visually distinguish unselected and selected portal entities
+// normal: material applied to portals in their default unselected state
+// highlighted: material applied to the first selected portal while waiting for the user to click a destination
 #[derive(Resource)]
 struct PortalMaterials {
     normal: Handle<StandardMaterial>,
     highlighted: Handle<StandardMaterial>,
 }
 
+// Marker component attached to the UI button that triggers a batch spawn of randomly routed cars
 #[derive(Component)]
 struct SpawnBatchButton;
 
+// Parses a URL-encoded form body string into a key-value map, trimming whitespace from both keys and values
+// Input: body: &str containing the raw URL-encoded form data
+// Returns: HashMap<String, String> mapping each field name to its value
 fn parse_form(body: &str) -> HashMap<String, String> {
     body.split('&')
         .filter_map(|pair| {
@@ -72,6 +99,11 @@ fn parse_form(body: &str) -> HashMap<String, String> {
         .collect()
 }
 
+// Bevy resource storing the camera's current orbital state relative to a fixed focus point
+// yaw: horizontal rotation angle in radians around the Y axis
+// pitch: vertical rotation angle in radians, clamped to prevent flipping over the poles
+// radius: distance from the focus point to the camera, controlling zoom level
+// focus: the world space point the camera continuously looks at
 #[derive(Resource)]
 pub struct Orbit {
     yaw: f32,
@@ -81,6 +113,9 @@ pub struct Orbit {
 }
 
 impl Default for Orbit {
+    // Returns an Orbit positioned at a 45 degree angle and comfortable starting distance from the origin
+    // Input: none
+    // Returns: Orbit with yaw at -PI/4, pitch at PI/4, radius at 3200, and focus at the world origin
     fn default() -> Self {
         Self {
             yaw: -PI / 4.0,
@@ -91,6 +126,9 @@ impl Default for Orbit {
     }
 }
 
+// Computes the world space camera position for a given orbital state using spherical coordinates
+// Input: o: &Orbit containing the current yaw, pitch, radius, and focus
+// Returns: Vec3 representing the camera's position in world space
 fn orbit_pos(o: &Orbit) -> Vec3 {
     o.focus
         + Vec3::new(
@@ -100,9 +138,14 @@ fn orbit_pos(o: &Orbit) -> Vec3 {
         )
 }
 
+// ECS component storing the display color assigned to a car, used when rendering its path segments
+// 0: the Bevy Color value assigned to this car at spawn time
 #[derive(Component, Clone, Copy)]
 struct CarColor(Color);
 
+// Advances a linear congruential generator seed by one step and returns the new value
+// Input: seed: &mut u64 the current generator state, updated in place
+// Returns: u64 the new seed value after one LCG step
 fn lcg_step(seed: &mut u64) -> u64 {
     *seed = seed
         .wrapping_mul(6364136223846793005)
@@ -110,6 +153,9 @@ fn lcg_step(seed: &mut u64) -> u64 {
     *seed
 }
 
+// Generates a unique fully saturated random hue color for each car by combining a monotonic counter with the current system nanoseconds to seed an LCG
+// Input: none
+// Returns: Color with a randomly selected hue, full saturation, and full brightness
 fn rand_car_color() -> Color {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -137,11 +183,16 @@ fn rand_car_color() -> Color {
     Color::srgb(r, g, b)
 }
 
+// ECS component that stores the fixed world position of a node so that its 2D text label can be projected to screen space each frame
+// world_pos: the 3D world space position corresponding to the graph node this label belongs to
 #[derive(Component)]
 struct NodeLabel {
     world_pos: Vec3,
 }
 
+// Projects each node label's stored world position into screen space each frame and updates the label's 2D transform so it tracks its node in the viewport
+// Input: windows: Query<&Window> for the primary window dimensions; camera_q: Query for the 3D camera's Camera and GlobalTransform; labels: Query over NodeLabel and Transform pairs
+// Returns: none
 fn update_node_labels(
     windows: Query<&Window>,
     camera_q: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
@@ -168,6 +219,9 @@ fn update_node_labels(
     }
 }
 
+// Handles primary click events on portal entities, managing a two-click selection flow where the first click highlights the source portal and the second click spawns a car routed between the two selected portals
+// Input: event: On<Pointer<Click>> carrying the clicked entity and button; commands: Commands for spawning the car entity; meshes, materials: asset resources for building the car mesh and material; portal_mats: Res<PortalMaterials> for highlight toggling; city: NonSend<CityData> for portal coordinates and node IDs; selection: ResMut<PortalSelection> tracking current selection state; portal_markers: Query<&PortalMarker> to read the clicked portal's index; existing_cars: Query<&PreRoad> to prevent duplicate routes; mat_handles: Query for mutating portal mesh materials
+// Returns: none
 fn on_portal_click(
     event: On<Pointer<Click>>,
     mut commands: Commands,
@@ -282,6 +336,9 @@ fn on_portal_click(
     }
 }
 
+// Entry point that loads the city JSON, builds the Bevy app with all plugins and systems, and starts the main loop
+// Input: none
+// Returns: none
 fn main() {
     let json = std::fs::read_to_string(CITY_JSON_PATH)
         .unwrap_or_else(|e| panic!("Could not read {}: {}", CITY_JSON_PATH, e));
@@ -328,6 +385,9 @@ fn main() {
         .run();
 }
 
+// Startup system that spawns all static scene geometry including road segments, portal pads, exit markers, node labels, lighting, and both the 3D orbital camera and the 2D overlay camera
+// Input: commands: Commands for spawning all scene entities; meshes: ResMut<Assets<Mesh>> for road and portal geometry; materials: ResMut<Assets<StandardMaterial>> for road, portal, and exit materials; city: NonSend<CityData> providing the full city node and portal data
+// Returns: none
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -495,9 +555,13 @@ fn setup(
         });
 }
 
+// Marker component added to a car entity once its path segment meshes have been spawned, preventing the segments from being created more than once
 #[derive(Component)]
 struct PathRendered;
 
+// Spawns colored road segment meshes along each active car's assigned waypoint path, then marks the car entity so segments are not spawned again next frame
+// Input: commands: Commands for spawning segment entities and inserting PathRendered; meshes, materials: asset resources for building segment geometry; q: Query over cars that are on the roadway, have a color, and have not yet had their path rendered
+// Returns: none
 fn spawn_path_segments(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -550,6 +614,9 @@ fn spawn_path_segments(
     }
 }
 
+// Responds to presses of the batch spawn button by picking up to BATCH_SPAWN_COUNT random unique portal pairs, skipping any routes already in use, and spawning a car for each valid pair
+// Input: commands: Commands for spawning car entities; meshes, materials: asset resources for car geometry; interaction_q: Query for detecting button press interactions; city: NonSend<CityData> for portal data; selection: ResMut<PortalSelection> for car ID and port counters; existing_cars: Query<&PreRoad> to avoid duplicate routes
+// Returns: none
 fn spawn_batch_button_system(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,

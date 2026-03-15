@@ -8,6 +8,7 @@ Date Revised: 3/13/2026
 Revision History: Included in the numerous sprint artifacts.
 Preconditions: Not applicable/Redundant
 Postconditions: Not applicable/Redundant
+Citation: Used AI copilot for limited code generation - claude.ai
 */
 
 use actix_web::{App, HttpResponse, HttpServer, web};

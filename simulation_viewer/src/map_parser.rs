@@ -8,6 +8,7 @@ Date Revised: 3/13/2026
 Revision History: None
 Preconditions: Not applicable/Redundant
 Postconditions: Not applicable/Redundant
+Citation: Used AI copilot for limited code generation - claude.ai
 */
 
 use bevy::prelude::*;
@@ -36,7 +37,11 @@ impl CityData {
     // Input: id: &str the string identifier of the node to look up
     // Returns: (f32, f32) tuple of the node's x and y world coordinates, or (0.0, 0.0) if the ID is missing
     pub fn node_pos(&self, id: &str) -> (f32, f32) {
-        self.nodes.get(id).map(|n| (n.x, n.y)).unwrap_or((0.0, 0.0))
+        let node = self
+            .nodes
+            .get(id)
+            .unwrap_or_else(|| panic!("node '{}' not found", id));
+        (node.x, node.y)
     }
 }
 
@@ -337,7 +342,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect(b':');
             match key.as_str() {
-                "intersections" | "endpoints" => {
+                "intersections" => {
                     for n in self.parse_node_map() {
                         nodes.insert(n.id.clone(), n);
                     }

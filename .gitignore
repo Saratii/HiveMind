@@ -1,3 +1,4 @@
 bin/
 hive_mind_server/target/
 .vscode/
+simulation_viewer/target/

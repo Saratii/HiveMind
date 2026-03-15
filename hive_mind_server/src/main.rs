@@ -1,10 +1,10 @@
 /*
 prologue
 Name of program: main.rs
-Description: Main server logic for HiveMind
+Description: Main server logic for HiveMind. Creates various endpoints.
 Author: Maren Proplesch
 Date Created: 2/11/2026
-Date Revised: 3/1/2026
+Date Revised: 3/13/2026
 Revision History: Included in the numerous sprint artifacts.
 Preconditions: Not applicable/Redundant
 Postconditions: Not applicable/Redundant
@@ -12,227 +12,68 @@ Postconditions: Not applicable/Redundant
 
 use actix_web::{App, HttpResponse, HttpServer, web};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 mod map;
 mod pathfinding;
 
-use map::{CityGraph, CityMap};
+use map::CityMap;
 use pathfinding::compute_path;
 
-const DEFAULT_SPEED: f64 = 10.0;
+use crate::map::CityGraph;
+
+const DEFAULT_SPEED: f64 = 40.0;
 const ENDPOINT_HEALTH: &str = "/health";
 const ENDPOINT_CAR_COUNT: &str = "/car-count";
+const ENDPOINT_VALIDATE_ENTRY: &str = "/validate-entry";
 const CITY_MAP_PATH: &str = "../city.json";
 const BIND_ADDR: &str = "0.0.0.0:8080";
-const REGISTRY_HOST: &str = "http://127.0.0.1:9000";
-const REGISTRY_CAR_REGISTERED: &str = "/car-registered";
-const CAR_COMMAND: &str = "/command";
-const CAR_POSITION: &str = "/position";
 const ENDPOINT_REGISTER_CAR: &str = "/register-car";
-const WAYPOINT_PROXIMITY: f64 = 10.0;
-const POLL_EARLY_SECS: f64 = 2.0;
 
-//struct for a point with x and y coordinates
-#[derive(Clone)]
-pub struct Point {
-    pub x: f64,
-    pub y: f64,
-}
-
-//struct for a car with license plate, URL, and destination point
+// Represents a car registered with the system
+// license: the car's license plate string, used as a unique identifier throughout registration and eviction
+// _url: the callback URL for the car's onboard client, retained for future use but not currently active
 #[derive(Clone)]
 struct Car {
     license: String,
-    url: String,
-    dest: Point,
+    _url: String,
 }
 
-//struct for application state, containing registered cars and the city graph
+// Shared application state accessible across all request handlers via Actix's web::Data wrapper
+// cars: a mutex-guarded list of all cars that have been granted entry and are currently active on the roadway
+// pending: a mutex-guarded map of cars that have registered and received a path but have not yet been validated for roadway entry, keyed by license plate
+// city_graph: the fully built graph of the city road network, used to compute routes at registration time
 struct AppState {
     cars: Mutex<Vec<Car>>,
+    pending: Mutex<std::collections::HashMap<String, (Car, Vec<pathfinding::Waypoint>)>>,
     city_graph: CityGraph,
 }
 
-// TODO: Implement actual roadway validation logic
-//should determine if a car can enter based on other cars in the immediate roadway, may also need to signal them to make roomn
-//inputs: car to validate
-//returns true if car is allowed to enter roadway, false otherwise
+// Determines whether a given car is permitted to enter the roadway; currently always returns true and is intended to be expanded with real validation logic
+// Input: car: &Car
+// Returns: bool indicating whether the car should be allowed onto the roadway
 fn validate_enter_roadway(_car: &Car) -> bool {
     true
 }
 
-// Forward the registered car information to the registry service asynchronously
-//inputs: car license plate, car URL
-//returns: None
-fn forward_car(license: String, url: String) {
-    tokio::spawn(async move {
-        let body = format!("license={}&url={}", license, url);
-        let client = reqwest::Client::new();
-        let endpoint = format!("{}{}", REGISTRY_HOST, REGISTRY_CAR_REGISTERED);
-        match client.post(&endpoint).body(body).send().await {
-            Ok(_) => {}
-            Err(e) => eprintln!("Failed to forward car to {}: {}", endpoint, e),
-        }
-    });
-}
-
-//send a command to the car's API endpoint asynchronously
-//inputs: reqwest client, car URL, list of (key, value) parameters to include in the command
-//returns: None
-async fn send_car_command(client: &reqwest::Client, car_url: &str, params: &[(&str, &str)]) {
-    let body = params
-        .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect::<Vec<_>>()
-        .join("&");
-
-    let url = format!("{}{}", car_url, CAR_COMMAND);
-    match client
-        .post(&url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(body)
-        .send()
-        .await
-    {
-        Ok(r) => println!("Command to {}: status {}", url, r.status()),
-        Err(e) => eprintln!("Failed to send command to {}: {}", url, e),
+// Converts a computed path into a URL-encoded query string by listing each waypoint's node ID with an indexed key, prefixed by the total waypoint count
+// Input: path: &[pathfinding::Waypoint]
+// Returns: String containing the fully encoded waypoint payload ready to be appended to an HTTP response body
+fn encode_waypoints(path: &[pathfinding::Waypoint]) -> String {
+    let mut parts = vec![format!("wp_count={}", path.len())];
+    for (i, wp) in path.iter().enumerate() {
+        parts.push(format!("wp{}={}", i, wp.node_id));
     }
+    parts.join("&")
 }
 
-// Poll the car's position from its API endpoint asynchronously
-//inputs: reqwest client, car URL
-//returns Some((x, y)) coordinates of the car or None if the poll fails
-async fn get_car_position(client: &reqwest::Client, car_url: &str) -> Option<(f64, f64)> {
-    let url = format!("{}{}", car_url, CAR_POSITION);
-    let resp = client.get(&url).send().await.ok()?;
-    let text = resp.text().await.ok()?;
-    let mut x = None;
-    let mut y = None;
-    for pair in text.split('&') {
-        let mut kv = pair.splitn(2, '=');
-        let k = kv.next().unwrap_or("").trim();
-        let v = kv.next().unwrap_or("").trim();
-        match k {
-            "x" => x = v.parse().ok(),
-            "y" => y = v.parse().ok(),
-            _ => {}
-        }
-    }
-    Some((x?, y?))
-}
-
-//drive loop, sending commands to the car to follow the path of waypoints and polling its position to adjust timing
-//inputs: car URL, car license plate, path of waypoints, speed to drive, shared app state for eviction on arrival
-//returns: None
-fn start_drive_loop(
-    car_url: String,
-    license: String,
-    path: Vec<pathfinding::Waypoint>,
-    speed: f64,
-    state: Arc<AppState>,
-) {
-    tokio::spawn(async move {
-        let client = reqwest::Client::new();
-        if let Some(first) = path.first() {
-            let speed_str = format!("{:.2}", speed);
-            let dir_x_str = format!("{:.4}", first.dir_x);
-            let dir_y_str = format!("{:.4}", first.dir_y);
-            send_car_command(
-                &client,
-                &car_url,
-                &[
-                    ("type", "set_route"),
-                    ("license", &license),
-                    ("speed", &speed_str),
-                    ("direction_x", &dir_x_str),
-                    ("direction_y", &dir_y_str),
-                ],
-            )
-            .await;
-        }
-        for i in 0..path.len().saturating_sub(1) {
-            let wp = &path[i];
-            let next = &path[i + 1];
-            if speed <= 0.0 || wp.dist_to_next <= 0.0 {
-                continue;
-            }
-            let travel_secs = wp.dist_to_next / speed;
-            let sleep_secs = (travel_secs - POLL_EARLY_SECS).max(0.0);
-            tokio::time::sleep(Duration::from_secs_f64(sleep_secs)).await;
-            let near = match get_car_position(&client, &car_url).await {
-                Some((cx, cy)) => {
-                    let dist = (cx - next.x).hypot(cy - next.y);
-                    println!(
-                        "Car {} position ({:.1}, {:.1}), dist to waypoint {}: {:.1}m",
-                        license,
-                        cx,
-                        cy,
-                        i + 1,
-                        dist
-                    );
-                    dist < WAYPOINT_PROXIMITY
-                }
-                None => {
-                    eprintln!(
-                        "Car {} position poll failed at waypoint {}, proceeding anyway",
-                        license,
-                        i + 1
-                    );
-                    true
-                }
-            };
-            if !near {
-                tokio::time::sleep(Duration::from_secs_f64(POLL_EARLY_SECS)).await;
-            }
-            if i + 1 == path.len() - 1 {
-                println!("Car {} reached destination", license);
-                send_car_command(
-                    &client,
-                    &car_url,
-                    &[("type", "stop"), ("license", &license)],
-                )
-                .await;
-                state.cars.lock().unwrap().retain(|c| c.license != license);
-                println!("Car {} evicted from registry", license);
-                break;
-            }
-            let speed_str = format!("{:.2}", speed);
-            let dir_x_str = format!("{:.4}", next.dir_x);
-            let dir_y_str = format!("{:.4}", next.dir_y);
-            println!(
-                "Car {} turning at waypoint {}: dir ({}, {})",
-                license,
-                i + 1,
-                dir_x_str,
-                dir_y_str
-            );
-            send_car_command(
-                &client,
-                &car_url,
-                &[
-                    ("type", "set_route"),
-                    ("license", &license),
-                    ("speed", &speed_str),
-                    ("direction_x", &dir_x_str),
-                    ("direction_y", &dir_y_str),
-                ],
-            )
-            .await;
-        }
-    });
-}
-
-//endpoint for registering a car with a start and destination
-//inputs: HTTP POST with body containing license, URL, start_x, start_y, dest_x, dest_y
-//returns: HTTP response indicating success or failure of registration and pathfinding
+// Parses a URL-encoded request body to extract license, URL, start, and destination, computes a path through the city graph, and stores the car in the pending map to await entry validation
+// Input: state: web::Data<Arc<AppState>>, body: String containing the URL-encoded registration parameters
+// Returns: HttpResponse confirming registration by license plate, or a 400 if no valid path could be found
 async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResponse {
     let mut license = String::new();
     let mut url = String::new();
-    let mut start_x = 0.0;
-    let mut start_y = 0.0;
-    let mut dest_x = 0.0;
-    let mut dest_y = 0.0;
+    let mut start_id = String::new();
+    let mut dest_id = String::new();
     for pair in body.split('&') {
         let mut kv = pair.splitn(2, '=');
         let key = kv.next().unwrap_or("");
@@ -240,27 +81,17 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
         match key {
             "license" => license = val.to_string(),
             "url" => url = val.to_string(),
-            "start_x" => start_x = val.parse().unwrap_or(0.0),
-            "start_y" => start_y = val.parse().unwrap_or(0.0),
-            "dest_x" => dest_x = val.parse().unwrap_or(0.0),
-            "dest_y" => dest_y = val.parse().unwrap_or(0.0),
+            "start_id" => start_id = val.to_string(),
+            "dest_id" => dest_id = val.to_string(),
             _ => {}
         }
     }
-    let start = Point {
-        x: start_x,
-        y: start_y,
-    };
-    let dest = Point {
-        x: dest_x,
-        y: dest_y,
-    };
-    let path = match compute_path(&state.city_graph, &start, &dest) {
+    let path = match compute_path(&state.city_graph, &start_id, &dest_id) {
         Some(p) => p,
         None => {
             eprintln!(
-                "No path found for car {} from ({}, {}) to ({}, {})",
-                license, start_x, start_y, dest_x, dest_y
+                "No path for car {} from '{}' to '{}'",
+                license, start_id, dest_id
             );
             return HttpResponse::BadRequest()
                 .content_type("text/plain")
@@ -268,44 +99,82 @@ async fn register_car(state: web::Data<Arc<AppState>>, body: String) -> HttpResp
         }
     };
     println!(
-        "Car {}: path computed with {} waypoints",
+        "Car {}: registered, path has {} waypoints. Waiting for entry validation.",
         license,
         path.len()
     );
-    let speed = DEFAULT_SPEED; //make this more smart later
     let car = Car {
         license: license.clone(),
-        url: url.clone(),
-        dest,
+        _url: url.clone(),
     };
-    println!(
-        "Car registered: {} url={} ({:.2}, {:.2}) -> ({:.2}, {:.2})",
-        car.license, car.url, start_x, start_y, car.dest.x, car.dest.y
-    );
-    if !validate_enter_roadway(&car) {
-        println!("Car {} denied entry to roadway", car.license);
-        return HttpResponse::Forbidden()
-            .content_type("text/plain")
-            .body(format!("Car {} not allowed to enter roadway", license));
-    }
-    state.cars.lock().unwrap().push(car.clone());
-    println!("Car {} validated, starting drive loop", car.license);
-    start_drive_loop(
-        url.clone(),
-        license.clone(),
-        path,
-        speed,
-        Arc::clone(&state),
-    );
-    forward_car(license.clone(), url.clone());
+    state
+        .pending
+        .lock()
+        .unwrap()
+        .insert(license.clone(), (car, path));
     HttpResponse::Ok()
         .content_type("text/plain")
-        .body(format!("Car registered: {} url={}", license, url))
+        .body(format!("registered={}", license))
 }
 
-//endpoint for getting the total count of registered cars
-//inputs: HTTP GET request
-//returns: HTTP response with the total number of registered cars
+// Looks up a pending car by license plate, runs the entry validation check, and if approved moves the car into the active list and returns its assigned speed and waypoints; also schedules automatic eviction after 300 seconds
+// Input: state: web::Data<Arc<AppState>>, body: String containing the URL-encoded license parameter
+// Returns: HttpResponse with allowed status and waypoint payload on success, or a 400 if the license is not found in the pending map
+async fn validate_entry(state: web::Data<Arc<AppState>>, body: String) -> HttpResponse {
+    let mut license = String::new();
+    for pair in body.split('&') {
+        let mut kv = pair.splitn(2, '=');
+        if kv.next().unwrap_or("").trim() == "license" {
+            license = kv.next().unwrap_or("").trim().to_string();
+        }
+    }
+    let entry = state.pending.lock().unwrap().remove(&license);
+    let (car, path) = match entry {
+        Some(v) => v,
+        None => {
+            eprintln!("validate_entry: unknown license {}", license);
+            return HttpResponse::BadRequest()
+                .content_type("text/plain")
+                .body(format!("unknown license: {}", license));
+        }
+    };
+    if !validate_enter_roadway(&car) {
+        state
+            .pending
+            .lock()
+            .unwrap()
+            .insert(license.clone(), (car, path));
+        println!("Car {} denied roadway entry, will retry", license);
+        return HttpResponse::Ok()
+            .content_type("text/plain")
+            .body("allowed=false");
+    }
+    println!(
+        "Car {} granted roadway entry, sending {} waypoints",
+        license,
+        path.len()
+    );
+    state.cars.lock().unwrap().push(car.clone());
+    let license_evict = license.clone();
+    let state_evict = Arc::clone(&**state);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        state_evict
+            .cars
+            .lock()
+            .unwrap()
+            .retain(|c| c.license != license_evict);
+    });
+    let wp_payload = encode_waypoints(&path);
+    let response_body = format!("allowed=true&speed={:.2}&{}", DEFAULT_SPEED, wp_payload);
+    HttpResponse::Ok()
+        .content_type("text/plain")
+        .body(response_body)
+}
+
+// Reads the current length of the active cars list and returns it as a plain text response, useful for monitoring how many cars are on the roadway at any given time
+// Input: state: web::Data<Arc<AppState>>
+// Returns: HttpResponse containing the current active car count as a human-readable string
 async fn car_count(state: web::Data<Arc<AppState>>) -> HttpResponse {
     let count = state.cars.lock().unwrap().len();
     HttpResponse::Ok()
@@ -313,23 +182,23 @@ async fn car_count(state: web::Data<Arc<AppState>>) -> HttpResponse {
         .body(format!("Total cars registered: {}", count))
 }
 
-//endpoint for health check
-//inputs: HTTP GET request
-//returns: HTTP response indicating server is healthy
+// Simple liveness endpoint that returns a 200 OK with a plain text body, intended for use by load balancers or monitoring tools to confirm the server is up
+// Input: none
+// Returns: HttpResponse with a static body of "OK"
 async fn health() -> HttpResponse {
     HttpResponse::Ok().content_type("text/plain").body("OK")
 }
 
-//main server loop, run each of the endpoints
-//inputs: None
-//returns: Unknown server errors
+// Loads the city map from disk, builds the road network graph, initializes shared application state, and starts the Actix HTTP server with all registered routes
+// Input: none
+// Returns: std::io::Result<()> indicating whether the server bound and ran successfully
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let city_map = CityMap::load(CITY_MAP_PATH).unwrap_or_else(|e| {
         eprintln!("Error loading city map: {}", e);
         std::process::exit(1);
     });
-    println!("City map loaded: {} segments", city_map.segment_count());
+    println!("City map loaded: {} nodes", city_map.node_count());
     let city_graph = city_map.build_graph();
     println!(
         "City graph built: {} nodes, {} edges",
@@ -338,6 +207,7 @@ async fn main() -> std::io::Result<()> {
     );
     let state = Arc::new(AppState {
         cars: Mutex::new(Vec::new()),
+        pending: Mutex::new(std::collections::HashMap::new()),
         city_graph,
     });
     println!("Server running on http://{}", BIND_ADDR);
@@ -346,6 +216,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(state)
             .route(ENDPOINT_REGISTER_CAR, web::post().to(register_car))
+            .route(ENDPOINT_VALIDATE_ENTRY, web::post().to(validate_entry))
             .route(ENDPOINT_HEALTH, web::get().to(health))
             .route(ENDPOINT_CAR_COUNT, web::get().to(car_count))
     })

@@ -8,6 +8,7 @@ Date Revised: 3/13/2026
 Revision History: Included in the numerous sprint artifacts.
 Preconditions: Not applicable/Redundant
 Postconditions: Not applicable/Redundant
+Citation: Used AI copilot for limited code generation - claude.ai
 */
 
 use serde::Deserialize;
@@ -43,7 +44,6 @@ struct RawPortal {
 #[derive(Debug, Deserialize)]
 struct RawMap {
     pub intersections: HashMap<String, RawNode>,
-    pub endpoints: HashMap<String, RawNode>,
     pub parking_portals: HashMap<String, RawPortal>,
 }
 
@@ -110,12 +110,6 @@ impl CityMap {
             let n = &raw.intersections[k];
             push(k.clone(), n.x, n.y);
         }
-        let mut sorted_keys: Vec<String> = raw.endpoints.keys().cloned().collect();
-        sorted_keys.sort();
-        for k in &sorted_keys {
-            let n = &raw.endpoints[k];
-            push(k.clone(), n.x, n.y);
-        }
         let mut sorted_keys: Vec<String> = raw.parking_portals.keys().cloned().collect();
         sorted_keys.sort();
         for k in &sorted_keys {
@@ -141,11 +135,6 @@ impl CityMap {
                     .collect::<Vec<_>>()
             };
         for (id, node) in &raw.intersections {
-            for pair in collect_connects(id, &node.connects, &id_to_index) {
-                connection_set.insert(pair);
-            }
-        }
-        for (id, node) in &raw.endpoints {
             for pair in collect_connects(id, &node.connects, &id_to_index) {
                 connection_set.insert(pair);
             }

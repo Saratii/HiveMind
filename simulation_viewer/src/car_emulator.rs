@@ -8,6 +8,7 @@ Date Revised: 3/13/2026
 Revision History: None
 Preconditions: Not applicable/Redundant
 Postconditions: Not applicable/Redundant
+Citation: Used AI copilot for limited code generation - claude.ai
 */
 
 use bevy::prelude::*;
@@ -21,7 +22,7 @@ use std::{
 use ureq::post;
 
 use crate::{
-    ACCELERATION, EXIT_DRIVE_SPEED,
+    ACCELERATION, EXIT_DRIVE_SPEED, ROAD_WIDTH,
     map_parser::{CityData, Waypoint, parse_waypoints},
     parse_form,
 };
@@ -56,6 +57,13 @@ pub struct PreRoad {
     pub src_node_id: String,
     pub dst_node_id: String,
     pub polling_in_flight: bool,
+}
+
+// ECS component attached to a car entity after it finishes its roadway route, storing the parking lot center it should drive into before despawning
+// center: world XZ position of the destination parking lot center, used as the final drive-in target
+#[derive(Component)]
+pub struct PostRoad {
+    pub center: Vec3,
 }
 
 // Shared mutable state for a car's HTTP listener thread, including its current position, assigned waypoints, and movement parameters
@@ -111,18 +119,72 @@ pub struct CarPhysics {
 #[derive(Component, Clone)]
 pub struct CarLicense(pub String);
 
-// Advances the physics simulation for all active roadway cars each frame, steering each car toward its next waypoint, applying acceleration, and despawning the car and its path segments when the route is complete
-// Input: commands: Commands for despawning entities; time: Res<Time> for the frame delta; q: Query over car entities with Transform, CarPhysics, and CarLicense but without PreRoad; path_segs: Query over path segment entities with CarLicense but without CarPhysics or PreRoad
+// Marker component added to a car entity when it has finished its server-assigned route and is now driving into its destination parking lot
+#[derive(Component)]
+pub struct ParkingIn;
+
+// Displaces a slice of centerline waypoints into the right lane by computing each segment's right-hand perpendicular independently from its own travel direction, then assigning each waypoint the average of the perpendiculars from its adjacent segments so corners remain smooth; using per-segment directions instead of a single global direction ensures the offset is always toward the correct side regardless of which direction the server ordered the route
+// Input: waypoints: Vec<Waypoint> centerline waypoints parsed from the server response
+// Returns: Vec<Waypoint> with x and z fields shifted by ROAD_WIDTH * 0.25 to the right of the travel direction of each segment
+fn offset_waypoints_to_right_lane(waypoints: Vec<Waypoint>) -> Vec<Waypoint> {
+    let n = waypoints.len();
+    if n < 2 {
+        return waypoints;
+    }
+    let seg_right: Vec<Vec2> = (0..n - 1)
+        .map(|i| {
+            let dx = waypoints[i + 1].x - waypoints[i].x;
+            let dz = waypoints[i + 1].z - waypoints[i].z;
+            let mag = dx.hypot(dz);
+            if mag > 1e-6 {
+                Vec2::new(dz / mag, -dx / mag)
+            } else {
+                Vec2::ZERO
+            }
+        })
+        .collect();
+    let shift = ROAD_WIDTH * 0.25;
+    let mut result = Vec::with_capacity(n);
+    for i in 0..n {
+        let right = if i == 0 {
+            seg_right[0]
+        } else if i == n - 1 {
+            seg_right[n - 2]
+        } else {
+            let avg = seg_right[i - 1] + seg_right[i];
+            let mag = avg.length();
+            if mag > 1e-6 { avg / mag } else { seg_right[i] }
+        };
+        result.push(Waypoint {
+            node_id: waypoints[i].node_id.clone(),
+            x: waypoints[i].x + right.x * shift,
+            z: waypoints[i].z + right.y * shift,
+        });
+    }
+    result
+}
+
+// Advances the physics simulation for all active roadway cars each frame, steering each car toward its next waypoint, applying acceleration, transitioning to the parking drive-in once the route ends, and despawning once fully stopped after route completion without a parking target
+// Input: commands: Commands for despawning entities; time: Res<Time> for the frame delta; q: Query over car entities on the roadway that are not yet parking; path_segs: Query over path segment entities for cleanup on despawn
 // Returns: none
 pub fn update_car_physics(
     mut commands: Commands,
     time: Res<Time>,
-    mut q: Query<(Entity, &mut Transform, &mut CarPhysics, &CarLicense), Without<PreRoad>>,
+    mut q: Query<
+        (
+            Entity,
+            &mut Transform,
+            &mut CarPhysics,
+            &CarLicense,
+            Option<&PostRoad>,
+        ),
+        (Without<PreRoad>, Without<ParkingIn>),
+    >,
     path_segs: Query<(Entity, &CarLicense), (Without<CarPhysics>, Without<PreRoad>)>,
 ) {
     const PROXIMITY: f32 = 4.0;
     let dt = time.delta_secs();
-    for (car_entity, mut transform, mut physics, car_license) in q.iter_mut() {
+    for (car_entity, mut transform, mut physics, car_license, post_road) in q.iter_mut() {
         let (target_speed, stopped, wp_index, wp_count) = {
             let h = physics.http.lock().unwrap();
             (h.speed, h.stopped, h.wp_index, h.waypoints.len())
@@ -136,11 +198,15 @@ pub fn update_car_physics(
                 h.pos_x = transform.translation.x;
                 h.pos_z = transform.translation.z;
             } else if wp_count > 0 {
-                println!("{}: reached destination, despawning", car_license.0);
-                commands.entity(car_entity).despawn();
-                for (seg_entity, seg_license) in path_segs.iter() {
-                    if seg_license.0 == car_license.0 {
-                        commands.entity(seg_entity).despawn();
+                if post_road.is_some() {
+                    commands.entity(car_entity).insert(ParkingIn);
+                } else {
+                    println!("{}: reached destination, despawning", car_license.0);
+                    commands.entity(car_entity).despawn();
+                    for (seg_entity, seg_license) in path_segs.iter() {
+                        if seg_license.0 == car_license.0 {
+                            commands.entity(seg_entity).despawn();
+                        }
                     }
                 }
             }
@@ -176,6 +242,57 @@ pub fn update_car_physics(
                 h.stopped = true;
             }
         }
+        let mut h = physics.http.lock().unwrap();
+        h.pos_x = transform.translation.x;
+        h.pos_z = transform.translation.z;
+    }
+}
+
+// Drives cars that have finished their route into their destination parking lot, steering toward the lot center and despawning once they arrive
+// Input: commands: Commands for despawning entities; time: Res<Time> for the frame delta; q: Query over car entities with ParkingIn and PostRoad; path_segs: Query over path segment entities for cleanup on despawn
+// Returns: none
+pub fn parking_in_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut q: Query<
+        (
+            Entity,
+            &mut Transform,
+            &mut CarPhysics,
+            &CarLicense,
+            &PostRoad,
+        ),
+        With<ParkingIn>,
+    >,
+    path_segs: Query<(Entity, &CarLicense), (Without<CarPhysics>, Without<PreRoad>)>,
+) {
+    const PARK_SPEED: f32 = 40.0;
+    const PARK_PROXIMITY: f32 = 6.0;
+    let dt = time.delta_secs();
+    for (car_entity, mut transform, mut physics, car_license, post_road) in q.iter_mut() {
+        let diff = Vec2::new(
+            post_road.center.x - transform.translation.x,
+            post_road.center.z - transform.translation.z,
+        );
+        let dist = diff.length();
+        if dist < PARK_PROXIMITY {
+            println!("{}: parked, despawning", car_license.0);
+            commands.entity(car_entity).despawn();
+            for (seg_entity, seg_license) in path_segs.iter() {
+                if seg_license.0 == car_license.0 {
+                    commands.entity(seg_entity).despawn();
+                }
+            }
+            continue;
+        }
+        let dir = diff.normalize();
+        physics.dir_x = dir.x;
+        physics.dir_z = dir.y;
+        transform.rotation = car_facing_quat(dir.x, dir.y);
+        let delta = PARK_SPEED - physics.speed;
+        physics.speed += delta.clamp(-ACCELERATION * dt, ACCELERATION * dt);
+        transform.translation.x += physics.dir_x * physics.speed * dt;
+        transform.translation.z += physics.dir_z * physics.speed * dt;
         let mut h = physics.http.lock().unwrap();
         h.pos_x = transform.translation.x;
         h.pos_z = transform.translation.z;
@@ -406,6 +523,7 @@ pub fn pre_road_system(
                                     .collect::<Vec<_>>()
                                     .join(" -> ")
                             );
+                            let waypoints = offset_waypoints_to_right_lane(waypoints);
                             let mut h = physics.http.lock().unwrap();
                             h.waypoints = waypoints;
                             h.wp_index = 1;

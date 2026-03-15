@@ -8,6 +8,7 @@ Date Revised: 3/13/2026
 Revision History: None
 Preconditions: Not applicable/Redundant
 Postconditions: Not applicable/Redundant
+Citation: Used AI copilot for limited code generation - claude.ai
 */
 
 pub mod cameras;
@@ -22,7 +23,7 @@ use bevy::{
     picking::prelude::*,
     prelude::*,
     render::render_resource::{TextureViewDescriptor, TextureViewDimension},
-    ui::Node as UiNode,
+    ui::{Node as UiNode, UiTargetCamera},
     winit::{UpdateMode, WinitSettings},
 };
 use iyes_perf_ui::PerfUiPlugin;
@@ -32,22 +33,25 @@ use std::f32::consts::PI;
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    cameras::{OrbitMomentum, orbit_camera, zoom_camera},
+    cameras::{CameraMode, FlyCamState, OrbitMomentum, flycam_system, orbit_camera, zoom_camera},
     car_emulator::{
-        CarHttp, CarLicense, CarPhysics, PreRoad, PreRoadPhase, car_facing_quat, pre_road_system,
-        spawn_car_listener, update_car_physics,
+        CarHttp, CarLicense, CarPhysics, ParkingIn, PostRoad, PreRoad, PreRoadPhase,
+        car_facing_quat, parking_in_system, pre_road_system, spawn_car_listener,
+        update_car_physics,
     },
     map_parser::{CityData, PortalMarker, Waypoint, parse_city},
 };
 
 const CITY_JSON_PATH: &str = "../city.json";
-// const SERVER_URL: &str = "http://127.0.0.1:8080";
-const SERVER_URL: &str = "http://52.15.156.213:8080";
+const SERVER_URL: &str = "http://127.0.0.1:8080";
+// const SERVER_URL: &str = "http://52.15.156.213:8080";
 const REGISTER_CAR_ENDPOINT: &str = "/register-car";
 const VALIDATE_ENTRY_ENDPOINT: &str = "/validate-entry";
 const ACCELERATION: f32 = 50.0;
 const EXIT_DRIVE_SPEED: f32 = 80.0;
 const BATCH_SPAWN_COUNT: usize = 20;
+const CAR_SCALE: f32 = 5.0;
+const ROAD_WIDTH: f32 = 24.0;
 
 // Tracks which portal the user has clicked first when selecting a source-destination pair for spawning a car
 // first: the index into the city portals list of the first selected portal, or None if no portal is currently selected
@@ -99,6 +103,10 @@ struct CarAssets {
 // Marker component attached to the UI button that triggers a batch spawn of randomly routed cars
 #[derive(Component)]
 struct SpawnBatchButton;
+
+// Marker component attached to the UI button that toggles between orbit and fly camera modes
+#[derive(Component)]
+struct ToggleFlyCamButton;
 
 // Parses a URL-encoded form body string into a key-value map, trimming whitespace from both keys and values
 // Input: body: &str containing the raw URL-encoded form data
@@ -172,16 +180,6 @@ fn orbit_pos(o: &Orbit) -> Vec3 {
 #[derive(Component, Clone, Copy)]
 struct CarColor(Color);
 
-// Advances a linear congruential generator seed by one step and returns the new value
-// Input: seed: &mut u64 the current generator state, updated in place
-// Returns: u64 the new seed value after one LCG step
-fn lcg_step(seed: &mut u64) -> u64 {
-    *seed = seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    *seed
-}
-
 // Generates a unique fully saturated random hue color for each car by combining a monotonic counter with the current system nanoseconds to seed an LCG
 // Input: none
 // Returns: Color with a randomly selected hue, full saturation, and full brightness
@@ -248,6 +246,14 @@ fn update_node_labels(
     }
 }
 
+// Computes a right-lane lateral offset vector perpendicular to a direction of travel, displacing the car to the right side of the road by one quarter of ROAD_WIDTH
+// Input: dir: Vec2 normalized direction of travel from source node toward destination node
+// Returns: Vec2 lateral offset to add to a centerline position to place the car in the right lane
+fn right_lane_offset(dir: Vec2) -> Vec2 {
+    let right = Vec2::new(dir.y, -dir.x);
+    right * (ROAD_WIDTH * 0.25)
+}
+
 // Handles primary click events on portal entities, managing a two-click selection flow where the first click highlights the source portal and the second click spawns a car routed between the two selected portals
 // Input: event: On<Pointer<Click>> carrying the clicked entity and button; commands: Commands for spawning the car entity; portal_mats: Res<PortalMaterials> for highlight toggling; car_assets: Res<CarAssets> for the shared car scene handle; city: NonSend<CityData> for portal coordinates and node IDs; selection: ResMut<PortalSelection> tracking current selection state; portal_markers: Query<&PortalMarker> to read the clicked portal's index; existing_cars: Query<&PreRoad> to prevent duplicate routes; mat_handles: Query for mutating portal mesh materials
 // Returns: none
@@ -311,6 +317,15 @@ fn on_portal_click(
             } else {
                 center_xz
             };
+            let travel_dir = if to_exit.length() > 1e-6 {
+                to_exit.normalize()
+            } else {
+                Vec2::X
+            };
+            let lane_offset = right_lane_offset(travel_dir);
+            let spawn_xz = Vec2::new(sx, sz) + lane_offset;
+            let wait_xz_offset = wait_xz + lane_offset;
+            let road_entry_xz = exit_xz + lane_offset;
             let i = selection.next_car_id;
             selection.next_car_id += 1;
             let port = selection.next_port;
@@ -324,18 +339,19 @@ fn on_portal_click(
                 "Spawning {} on port {} from portal {} to portal {}",
                 license, port, src_idx, clicked_idx
             );
-            let http_state = Arc::new(Mutex::new(CarHttp::new(sx, sz)));
+            let dst_center = city.portals[clicked_idx].center;
+            let http_state = Arc::new(Mutex::new(CarHttp::new(spawn_xz.x, spawn_xz.y)));
             spawn_car_listener(port, Arc::clone(&http_state));
             commands
                 .spawn((
-                    Transform::from_xyz(sx, 30.0, sz),
+                    Transform::from_xyz(spawn_xz.x, 13.5, spawn_xz.y),
                     Visibility::Inherited,
                     CarColor(car_color),
                     CarLicense(license.clone()),
                     PreRoad {
                         phase: PreRoadPhase::DrivingToWait,
-                        wait_target: Vec3::new(wait_xz.x, 30.0, wait_xz.y),
-                        road_entry: Vec3::new(ex, 30.0, ez),
+                        wait_target: Vec3::new(wait_xz_offset.x, 13.5, wait_xz_offset.y),
+                        road_entry: Vec3::new(road_entry_xz.x, 13.5, road_entry_xz.y),
                         license,
                         car_url,
                         register_url,
@@ -343,6 +359,9 @@ fn on_portal_click(
                         src_node_id: src.node.id.clone(),
                         dst_node_id: city.portals[clicked_idx].node.id.clone(),
                         polling_in_flight: false,
+                    },
+                    PostRoad {
+                        center: Vec3::new(dst_center[0], 13.5, dst_center[1]),
                     },
                     CarPhysics {
                         http: http_state,
@@ -354,7 +373,7 @@ fn on_portal_click(
                 .with_children(|parent| {
                     parent.spawn((
                         SceneRoot(car_assets.scene.clone()),
-                        Transform::from_xyz(0.0, 0.0, 0.0).with_scale(Vec3::splat(10.0)),
+                        Transform::from_xyz(0.0, 0.0, 0.0).with_scale(Vec3::splat(CAR_SCALE)),
                     ));
                     parent.spawn((Transform::IDENTITY, Pickable::IGNORE));
                 });
@@ -394,6 +413,8 @@ fn main() {
         })
         .insert_resource(Orbit::default())
         .insert_resource(OrbitMomentum::default())
+        .insert_resource(CameraMode::default())
+        .insert_resource(FlyCamState::default())
         .insert_resource(PortalSelection::new())
         .insert_non_send_resource(city)
         .add_systems(Startup, setup)
@@ -402,11 +423,15 @@ fn main() {
             (
                 orbit_camera,
                 zoom_camera,
+                flycam_system,
+                toggle_flycam_system,
                 update_node_labels,
                 pre_road_system,
                 update_car_physics,
+                parking_in_system,
                 update_car_rotation,
                 spawn_path_segments,
+                despawn_passed_segments,
                 spawn_batch_button_system,
                 fix_skybox_view,
             ),
@@ -434,9 +459,9 @@ fn setup(
         scene: car_scene,
         skybox: skybox_image.clone(),
     });
-    commands.spawn(PerfUiDefaultEntries::default());
     let portal_normal_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.3, 0.8, 0.3),
+        base_color: Color::srgb(0.08, 0.08, 0.08),
+        perceptual_roughness: 0.95,
         ..default()
     });
     let portal_highlight_mat = materials.add(StandardMaterial {
@@ -445,21 +470,37 @@ fn setup(
         ..default()
     });
     commands.insert_resource(PortalMaterials {
-        normal: portal_normal_mat.clone(),
+        normal: portal_normal_mat,
         highlighted: portal_highlight_mat,
     });
-    let portal_mat = portal_normal_mat;
     let exit_mat = materials.add(StandardMaterial {
         base_color: Color::srgb(0.6, 0.0, 1.0),
         emissive: LinearRgba::new(0.4, 0.0, 1.0, 1.0),
         ..default()
     });
-    let road_thickness = 20.0_f32;
     let road_height = 10.0_f32;
-    let exit_mesh = meshes.add(Sphere::new(8.0));
-    let mut road_color_seed: u64 = 0xf00dcafe_deadbeef;
+    let exit_mesh = meshes.add(Sphere::new(4.0));
     let mut rendered_edges: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
+    let road_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.45, 0.45, 0.45),
+        perceptual_roughness: 0.95,
+        ..default()
+    });
+    let junction_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.30, 0.30, 0.30),
+        perceptual_roughness: 0.95,
+        ..default()
+    });
+    for node in city.nodes.values() {
+        commands.spawn((
+            Mesh3d(meshes.add(Cuboid::new(ROAD_WIDTH, road_height, ROAD_WIDTH))),
+            MeshMaterial3d(junction_mat.clone()),
+            Transform::from_xyz(node.x, road_height * 0.5, node.y),
+            Pickable::IGNORE,
+        ));
+    }
+    let shrink = ROAD_WIDTH * 0.5;
     for (id, node) in &city.nodes {
         for nb_id in &node.connects {
             let key = if id.as_str() < nb_id.as_str() {
@@ -478,21 +519,58 @@ fn setup(
             if len < 0.01 {
                 continue;
             }
+            let trimmed_len = (len - shrink * 2.0).max(0.1);
             let mid = Vec2::new((ax + bx) * 0.5, (az + bz) * 0.5);
             let angle = diff.y.atan2(diff.x);
-            let raw = lcg_step(&mut road_color_seed);
-            let grey = 0.25 + ((raw >> 33) as f32 / u32::MAX as f32) * 0.45;
-            let road_mat = materials.add(StandardMaterial {
-                base_color: Color::srgb(grey, grey, grey),
-                ..default()
-            });
+            let rot = Quat::from_rotation_y(-angle);
             commands.spawn((
-                Mesh3d(meshes.add(Cuboid::new(len, road_height, road_thickness))),
-                MeshMaterial3d(road_mat),
-                Transform::from_xyz(mid.x, road_height * 0.5, mid.y)
-                    .with_rotation(Quat::from_rotation_y(-angle)),
+                Mesh3d(meshes.add(Cuboid::new(trimmed_len, road_height, ROAD_WIDTH))),
+                MeshMaterial3d(road_mat.clone()),
+                Transform::from_xyz(mid.x, road_height * 0.5, mid.y).with_rotation(rot),
                 Pickable::IGNORE,
             ));
+            let divider_mat = materials.add(StandardMaterial {
+                base_color: Color::srgb(1.0, 0.85, 0.0),
+                emissive: LinearRgba::new(0.3, 0.25, 0.0, 1.0),
+                unlit: false,
+                ..default()
+            });
+            let dash_len = 40.0;
+            let dash_gap = 30.0;
+            let dash_w = 1.5;
+            let dash_h = road_height + 0.1;
+            let dash_period = dash_len + dash_gap;
+            let num_dashes = (trimmed_len / dash_period).floor() as i32;
+            let total_dashes_len = num_dashes as f32 * dash_period;
+            let start_offset = -total_dashes_len * 0.5 + dash_len * 0.5;
+            for d in 0..num_dashes {
+                let local_x = start_offset + d as f32 * dash_period;
+                let offset = rot * Vec3::new(local_x, 0.0, 0.0);
+                commands.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(dash_len, 1.0, dash_w))),
+                    MeshMaterial3d(divider_mat.clone()),
+                    Transform::from_xyz(mid.x + offset.x, dash_h, mid.y + offset.z)
+                        .with_rotation(rot),
+                    Pickable::IGNORE,
+                ));
+            }
+            let edge_mat = materials.add(StandardMaterial {
+                base_color: Color::srgb(0.95, 0.95, 0.95),
+                emissive: LinearRgba::new(0.15, 0.15, 0.15, 1.0),
+                ..default()
+            });
+            let edge_inset = ROAD_WIDTH * 0.5 - 2.5;
+            let edge_y = road_height + 0.1;
+            for sign in [-1.0_f32, 1.0] {
+                let local_offset = rot * Vec3::new(0.0, 0.0, sign * edge_inset);
+                commands.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(trimmed_len, 1.0, 2.0))),
+                    MeshMaterial3d(edge_mat.clone()),
+                    Transform::from_xyz(mid.x + local_offset.x, edge_y, mid.y + local_offset.z)
+                        .with_rotation(rot),
+                    Pickable::IGNORE,
+                ));
+            }
         }
     }
     let (mut min_x, mut max_x, mut min_z, mut max_z) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
@@ -502,7 +580,7 @@ fn setup(
         min_z = min_z.min(node.y);
         max_z = max_z.max(node.y);
     }
-    let pad = 200.0_f32;
+    let pad = 200.0;
     let gx = (min_x + max_x) * 0.5;
     let gz = (min_z + max_z) * 0.5;
     let gw = (max_x - min_x) + pad * 2.0;
@@ -518,8 +596,8 @@ fn setup(
         Transform::from_xyz(gx, -1.0, gz),
         Pickable::IGNORE,
     ));
-    let wall_h = 40.0_f32;
-    let wall_t = 20.0_f32;
+    let wall_h = 40.0;
+    let wall_t = 20.0;
     let border_mat = materials.add(StandardMaterial {
         base_color: Color::srgb(0.25, 0.25, 0.28),
         perceptual_roughness: 0.7,
@@ -550,22 +628,82 @@ fn setup(
         Transform::from_xyz(gx + gw * 0.5 + wall_t * 0.5, wall_y, gz),
         Pickable::IGNORE,
     ));
+    let lot_size = 200.0_f32;
+    let lot_h = 3.0_f32;
+    let lot_surf_y = lot_h + 0.1;
+    let lot_asphalt_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.08, 0.08, 0.08),
+        perceptual_roughness: 0.95,
+        ..default()
+    });
+    let lot_border_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.9, 0.9, 0.9),
+        emissive: LinearRgba::new(0.1, 0.1, 0.1, 1.0),
+        ..default()
+    });
+    let lot_line_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.7, 0.7, 0.7),
+        ..default()
+    });
+    let lot_border_inset = 4.0_f32;
+    let lot_border_w = 1.5_f32;
+    let lot_border_h = 0.8_f32;
+    let spot_w = 22.0_f32;
+    let spot_depth = 50.0_f32;
+    let spot_line_t = 1.2_f32;
+    let spot_line_h = 0.6_f32;
+    let inner = lot_size - lot_border_inset * 2.0;
+    let num_spots = ((inner / spot_w).floor() as i32).max(1);
+    let spots_total_w = num_spots as f32 * spot_w;
     for (portal_index, portal) in city.portals.iter().enumerate() {
         let [cx, cz] = portal.center;
         let (ex, ez) = (portal.node.x, portal.node.y);
         commands
             .spawn((
-                Mesh3d(meshes.add(Cuboid::new(200.0, 5.0, 200.0))),
-                MeshMaterial3d(portal_mat.clone()),
-                Transform::from_xyz(cx, 2.5, cz),
+                Mesh3d(meshes.add(Cuboid::new(lot_size, lot_h, lot_size))),
+                MeshMaterial3d(lot_asphalt_mat.clone()),
+                Transform::from_xyz(cx, lot_h * 0.5, cz),
                 PortalMarker { portal_index },
                 Pickable::default(),
             ))
             .observe(on_portal_click);
+        let border_edge = lot_size * 0.5 - lot_border_inset;
+        for sign in [-1.0_f32, 1.0] {
+            commands.spawn((
+                Mesh3d(meshes.add(Cuboid::new(
+                    lot_size - lot_border_inset * 2.0,
+                    lot_border_h,
+                    lot_border_w,
+                ))),
+                MeshMaterial3d(lot_border_mat.clone()),
+                Transform::from_xyz(cx, lot_surf_y, cz + sign * border_edge),
+                Pickable::IGNORE,
+            ));
+            commands.spawn((
+                Mesh3d(meshes.add(Cuboid::new(
+                    lot_border_w,
+                    lot_border_h,
+                    lot_size - lot_border_inset * 2.0,
+                ))),
+                MeshMaterial3d(lot_border_mat.clone()),
+                Transform::from_xyz(cx + sign * border_edge, lot_surf_y, cz),
+                Pickable::IGNORE,
+            ));
+        }
+        let start_x = cx - spots_total_w * 0.5;
+        for row in 0..=num_spots {
+            let lx = start_x + row as f32 * spot_w;
+            commands.spawn((
+                Mesh3d(meshes.add(Cuboid::new(spot_line_t, spot_line_h, spot_depth))),
+                MeshMaterial3d(lot_line_mat.clone()),
+                Transform::from_xyz(lx, lot_surf_y, cz),
+                Pickable::IGNORE,
+            ));
+        }
         commands.spawn((
             Mesh3d(exit_mesh.clone()),
             MeshMaterial3d(exit_mat.clone()),
-            Transform::from_xyz(ex, 18.0, ez),
+            Transform::from_xyz(ex, 12.0, ez),
             Pickable::IGNORE,
         ));
     }
@@ -599,7 +737,7 @@ fn setup(
     commands.spawn((
         DirectionalLight {
             illuminance: 15_000.0,
-            shadows_enabled: false,
+            shadows_enabled: true,
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -PI / 4.0, PI / 5.0, 0.0)),
@@ -618,14 +756,17 @@ fn setup(
         },
         Transform::from_translation(pos).looking_at(Vec3::ZERO, Vec3::Y),
     ));
-    commands.spawn((
-        Camera2d,
-        Camera {
-            order: 1,
-            clear_color: ClearColorConfig::None,
-            ..default()
-        },
-    ));
+    let ui_camera = commands
+        .spawn((
+            Camera2d,
+            Camera {
+                order: 1,
+                clear_color: ClearColorConfig::None,
+                ..default()
+            },
+        ))
+        .id();
+    commands.spawn((PerfUiDefaultEntries::default(), UiTargetCamera(ui_camera)));
     commands
         .spawn((
             UiNode {
@@ -659,6 +800,40 @@ fn setup(
                 TextColor(Color::WHITE),
             ));
         });
+    commands
+        .spawn((
+            UiNode {
+                position_type: PositionType::Absolute,
+                bottom: Val::Px(20.0),
+                left: Val::Px(200.0),
+                width: Val::Px(160.0),
+                height: Val::Px(48.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
+            Button,
+            ToggleFlyCamButton,
+            BorderColor {
+                top: Color::srgb(0.6, 0.6, 0.7),
+                right: Color::srgb(0.6, 0.6, 0.7),
+                bottom: Color::srgb(0.6, 0.6, 0.7),
+                left: Color::srgb(0.6, 0.6, 0.7),
+            },
+            BackgroundColor(Color::srgba(0.1, 0.1, 0.15, 0.85)),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new("Orbit Cam"),
+                TextFont {
+                    font_size: 20.0,
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+                ToggleFlyCamButton,
+            ));
+        });
 }
 
 // Waits for the skybox image to finish loading then sets its texture view dimension to Cube so the GPU binds it correctly; runs every frame but exits immediately once the descriptor is set
@@ -685,10 +860,21 @@ fn fix_skybox_view(car_assets: Res<CarAssets>, mut images: ResMut<Assets<Image>>
 #[derive(Component)]
 struct PathRendered;
 
+// Component attached to each path debug segment mesh identifying which car and which waypoint interval it visualizes
+// car_license: license plate of the car this segment belongs to, used to match against CarLicense on the car entity
+// seg_index: the index i of the waypoint pair (i, i+1) this segment represents, used to despawn it once the car passes waypoint i+1
+#[derive(Component)]
+struct PathSegment {
+    car_license: String,
+    seg_index: usize,
+}
+
 // Rotates each active roadway car each frame to face the direction it is currently moving, reading dir_x and dir_z from CarPhysics and delegating to car_facing_quat for the angle calculation
 // Input: q: Query over entities with Transform and CarPhysics but without PreRoad, covering all cars currently on the roadway
 // Returns: none
-fn update_car_rotation(mut q: Query<(&mut Transform, &CarPhysics), Without<PreRoad>>) {
+fn update_car_rotation(
+    mut q: Query<(&mut Transform, &CarPhysics), (Without<PreRoad>, Without<ParkingIn>)>,
+) {
     for (mut transform, physics) in q.iter_mut() {
         if physics.speed < 0.1 {
             continue;
@@ -717,9 +903,9 @@ fn spawn_path_segments(
         if waypoints.is_empty() {
             continue;
         }
-        let seg_height = 6.0;
-        let seg_thickness = 12.0;
-        let y_offset = 20.0;
+        let seg_height = 2.0;
+        let seg_thickness = 5.0;
+        let y_offset = 11.0;
         let path_mat = materials.add(StandardMaterial {
             base_color: car_color.0,
             emissive: {
@@ -745,10 +931,86 @@ fn spawn_path_segments(
                 Transform::from_xyz(mid.x, y_offset, mid.y)
                     .with_rotation(Quat::from_rotation_y(-angle)),
                 CarLicense(car_license.0.clone()),
+                PathSegment {
+                    car_license: car_license.0.clone(),
+                    seg_index: i,
+                },
                 Pickable::IGNORE,
             ));
         }
         commands.entity(entity).insert(PathRendered);
+    }
+}
+
+// Despawns each path debug segment whose waypoint interval the car has already passed, checking wp_index against seg_index each frame so segments are removed as the car drives through them rather than all at once at route completion
+// Input: commands: Commands for despawning segment entities; cars: Query over active roadway cars providing their license and CarPhysics for wp_index lookup; segments: Query over PathSegment entities to check and despawn
+// Returns: none
+fn despawn_passed_segments(
+    mut commands: Commands,
+    cars: Query<(&CarLicense, &CarPhysics), Without<PreRoad>>,
+    segments: Query<(Entity, &PathSegment)>,
+) {
+    for (entity, seg) in segments.iter() {
+        for (car_license, physics) in cars.iter() {
+            if car_license.0 != seg.car_license {
+                continue;
+            }
+            let wp_index = physics.http.lock().unwrap().wp_index;
+            if wp_index > seg.seg_index + 1 {
+                commands.entity(entity).despawn();
+            }
+            break;
+        }
+    }
+}
+
+// Handles presses of the fly cam toggle button, switching CameraMode between Orbit and Fly and updating the button label; when switching to Fly the camera moves to the last fly position and rotation; when switching to Orbit the orbit state is reconstructed from the current camera position so it resumes from where fly left off
+// Input: mode: ResMut<CameraMode> the current camera mode toggled on press; orbit: ResMut<Orbit> updated from current camera position when returning to Orbit; fly_state: ResMut<FlyCamState> updated from current camera transform when entering Fly; interaction_q: Query detecting button presses on ToggleFlyCamButton; label_q: Query over Text entities with ToggleFlyCamButton used to update the button label; cam_q: Query<&mut Transform, With<Camera3d>> to reposition the camera on mode switch
+// Returns: none
+fn toggle_flycam_system(
+    mut mode: ResMut<CameraMode>,
+    mut orbit: ResMut<Orbit>,
+    mut fly_state: ResMut<FlyCamState>,
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<ToggleFlyCamButton>)>,
+    mut label_q: Query<&mut Text, With<ToggleFlyCamButton>>,
+    mut cam_q: Query<&mut Transform, With<Camera3d>>,
+) {
+    let clicked = interaction_q.iter().any(|i| *i == Interaction::Pressed);
+    if !clicked {
+        return;
+    }
+    let Ok(mut t) = cam_q.single_mut() else {
+        return;
+    };
+    match *mode {
+        CameraMode::Orbit => {
+            fly_state.position = t.translation;
+            let (yaw, pitch, _) = t.rotation.to_euler(EulerRot::YXZ);
+            fly_state.yaw = yaw;
+            fly_state.pitch = pitch;
+            *mode = CameraMode::Fly;
+        }
+        CameraMode::Fly => {
+            let pos = t.translation;
+            let flat = Vec3::new(pos.x, 0.0, pos.z);
+            let radius = pos.length().max(150.0);
+            orbit.radius = radius;
+            orbit.focus = Vec3::ZERO;
+            orbit.yaw = flat.x.atan2(flat.z);
+            orbit.pitch = (pos.y / radius).asin().clamp(0.05, PI / 2.0 - 0.05);
+            *t = Transform::from_translation(orbit_pos(&orbit)).looking_at(orbit.focus, Vec3::Y);
+            *mode = CameraMode::Orbit;
+        }
+    }
+    for mut text in label_q.iter_mut() {
+        text.0 = match *mode {
+            CameraMode::Orbit => "Orbit Cam".to_string(),
+            CameraMode::Fly => "Fly Cam".to_string(),
+        };
+    }
+    if *mode == CameraMode::Fly {
+        t.translation = fly_state.position;
+        t.rotation = Quat::from_euler(EulerRot::YXZ, fly_state.yaw, fly_state.pitch, 0.0);
     }
 }
 
@@ -815,6 +1077,15 @@ fn spawn_batch_button_system(
         } else {
             center_xz
         };
+        let travel_dir = if to_exit.length() > 1e-6 {
+            to_exit.normalize()
+        } else {
+            Vec2::X
+        };
+        let lane_offset = right_lane_offset(travel_dir);
+        let spawn_xz = Vec2::new(sx, sz) + lane_offset;
+        let wait_xz_offset = wait_xz + lane_offset;
+        let road_entry_xz = exit_xz + lane_offset;
         let i = selection.next_car_id;
         selection.next_car_id += 1;
         let port = selection.next_port;
@@ -828,18 +1099,19 @@ fn spawn_batch_button_system(
             "Batch spawning {} port {} : {} -> {}",
             license, port, src_idx, dst_idx
         );
-        let http_state = Arc::new(Mutex::new(CarHttp::new(sx, sz)));
+        let dst_center = portals[dst_idx].center;
+        let http_state = Arc::new(Mutex::new(CarHttp::new(spawn_xz.x, spawn_xz.y)));
         spawn_car_listener(port, Arc::clone(&http_state));
         commands
             .spawn((
-                Transform::from_xyz(sx, 30.0, sz),
+                Transform::from_xyz(spawn_xz.x, 13.5, spawn_xz.y),
                 Visibility::Inherited,
                 CarColor(car_color),
                 CarLicense(license.clone()),
                 PreRoad {
                     phase: PreRoadPhase::DrivingToWait,
-                    wait_target: Vec3::new(wait_xz.x, 30.0, wait_xz.y),
-                    road_entry: Vec3::new(ex, 30.0, ez),
+                    wait_target: Vec3::new(wait_xz_offset.x, 13.5, wait_xz_offset.y),
+                    road_entry: Vec3::new(road_entry_xz.x, 13.5, road_entry_xz.y),
                     license,
                     car_url,
                     register_url,
@@ -847,6 +1119,9 @@ fn spawn_batch_button_system(
                     src_node_id: src_id,
                     dst_node_id: dst_id,
                     polling_in_flight: false,
+                },
+                PostRoad {
+                    center: Vec3::new(dst_center[0], 13.5, dst_center[1]),
                 },
                 CarPhysics {
                     http: http_state,
@@ -858,7 +1133,7 @@ fn spawn_batch_button_system(
             .with_children(|parent| {
                 parent.spawn((
                     SceneRoot(car_assets.scene.clone()),
-                    Transform::from_xyz(0.0, 0.0, 0.0).with_scale(Vec3::splat(10.0)),
+                    Transform::from_xyz(0.0, 0.0, 0.0).with_scale(Vec3::splat(CAR_SCALE)),
                 ));
                 parent.spawn((Transform::IDENTITY, Pickable::IGNORE));
             });

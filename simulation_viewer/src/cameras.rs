@@ -44,7 +44,7 @@ pub fn orbit_camera(
     const TRACKING: f32 = 30.0;
     if btn.pressed(MouseButton::Left) && motion.delta != Vec2::ZERO {
         let target_yaw_vel = -motion.delta.x * 0.005 / dt.max(0.001);
-        let target_pitch_vel = -motion.delta.y * 0.005 / dt.max(0.001);
+        let target_pitch_vel = motion.delta.y * 0.005 / dt.max(0.001);
         momentum.yaw_vel += (target_yaw_vel - momentum.yaw_vel) * (TRACKING * dt).min(1.0);
         momentum.pitch_vel += (target_pitch_vel - momentum.pitch_vel) * (TRACKING * dt).min(1.0);
     } else {

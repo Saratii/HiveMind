@@ -15,10 +15,13 @@ pub mod car_emulator;
 pub mod map_parser;
 
 use bevy::{
+    core_pipeline::Skybox,
     diagnostic::{EntityCountDiagnosticsPlugin, FrameTimeDiagnosticsPlugin},
+    image::{ImageArrayLayout, ImageLoaderSettings, ImageSampler},
     pbr::wireframe::WireframePlugin,
     picking::prelude::*,
     prelude::*,
+    render::render_resource::{TextureViewDescriptor, TextureViewDimension},
     ui::Node as UiNode,
     winit::{UpdateMode, WinitSettings},
 };
@@ -29,9 +32,9 @@ use std::f32::consts::PI;
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    cameras::{orbit_camera, zoom_camera},
+    cameras::{OrbitMomentum, orbit_camera, zoom_camera},
     car_emulator::{
-        CarHttp, CarLicense, CarPhysics, PreRoad, PreRoadPhase, pre_road_system,
+        CarHttp, CarLicense, CarPhysics, PreRoad, PreRoadPhase, car_facing_quat, pre_road_system,
         spawn_car_listener, update_car_physics,
     },
     map_parser::{CityData, PortalMarker, Waypoint, parse_city},
@@ -79,6 +82,17 @@ impl PortalSelection {
 struct PortalMaterials {
     normal: Handle<StandardMaterial>,
     highlighted: Handle<StandardMaterial>,
+}
+
+// Holds the preloaded scene handle for the car GLB model and the shared hitbox mesh and material handles, inserted as a resource during startup and shared across all car spawn sites
+// scene: handle to the first scene extracted from Car2.glb, used as the SceneRoot for every spawned car entity
+// hitbox_mesh: handle to a box mesh sized to approximate the car footprint, rendered as a debug overlay on the physics parent
+// hitbox_mat: handle to a semi-transparent red material applied to the hitbox mesh so it is visible over the road
+// skybox: handle to the column PNG image so the fix_skybox_view system can set its texture view dimension to Cube after load
+#[derive(Resource)]
+struct CarAssets {
+    scene: Handle<Scene>,
+    skybox: Handle<Image>,
 }
 
 // Marker component attached to the UI button that triggers a batch spawn of randomly routed cars
@@ -220,14 +234,13 @@ fn update_node_labels(
 }
 
 // Handles primary click events on portal entities, managing a two-click selection flow where the first click highlights the source portal and the second click spawns a car routed between the two selected portals
-// Input: event: On<Pointer<Click>> carrying the clicked entity and button; commands: Commands for spawning the car entity; meshes, materials: asset resources for building the car mesh and material; portal_mats: Res<PortalMaterials> for highlight toggling; city: NonSend<CityData> for portal coordinates and node IDs; selection: ResMut<PortalSelection> tracking current selection state; portal_markers: Query<&PortalMarker> to read the clicked portal's index; existing_cars: Query<&PreRoad> to prevent duplicate routes; mat_handles: Query for mutating portal mesh materials
+// Input: event: On<Pointer<Click>> carrying the clicked entity and button; commands: Commands for spawning the car entity; portal_mats: Res<PortalMaterials> for highlight toggling; car_assets: Res<CarAssets> for the shared car scene handle; city: NonSend<CityData> for portal coordinates and node IDs; selection: ResMut<PortalSelection> tracking current selection state; portal_markers: Query<&PortalMarker> to read the clicked portal's index; existing_cars: Query<&PreRoad> to prevent duplicate routes; mat_handles: Query for mutating portal mesh materials
 // Returns: none
 fn on_portal_click(
     event: On<Pointer<Click>>,
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     portal_mats: Res<PortalMaterials>,
+    car_assets: Res<CarAssets>,
     city: NonSend<CityData>,
     mut selection: ResMut<PortalSelection>,
     portal_markers: Query<&PortalMarker>,
@@ -292,46 +305,44 @@ fn on_portal_click(
             let register_url = format!("{}{}", SERVER_URL, REGISTER_CAR_ENDPOINT);
             let validate_url = format!("{}{}", SERVER_URL, VALIDATE_ENTRY_ENDPOINT);
             let car_color = rand_car_color();
-            let car_mat = materials.add(StandardMaterial {
-                base_color: car_color,
-                emissive: {
-                    let lc = car_color.to_linear();
-                    LinearRgba::new(lc.red * 0.8, lc.green * 0.8, lc.blue * 0.8, 1.0)
-                },
-                ..default()
-            });
             println!(
                 "Spawning {} on port {} from portal {} to portal {}",
                 license, port, src_idx, clicked_idx
             );
             let http_state = Arc::new(Mutex::new(CarHttp::new(sx, sz)));
             spawn_car_listener(port, Arc::clone(&http_state));
-            let car_mesh = meshes.add(Sphere::new(10.0));
-            commands.spawn((
-                Mesh3d(car_mesh),
-                MeshMaterial3d(car_mat),
-                Transform::from_xyz(sx, 30.0, sz),
-                CarColor(car_color),
-                CarLicense(license.clone()),
-                PreRoad {
-                    phase: PreRoadPhase::DrivingToWait,
-                    wait_target: Vec3::new(wait_xz.x, 30.0, wait_xz.y),
-                    road_entry: Vec3::new(ex, 30.0, ez),
-                    license,
-                    car_url,
-                    register_url,
-                    validate_url,
-                    src_node_id: src.node.id.clone(),
-                    dst_node_id: city.portals[clicked_idx].node.id.clone(),
-                    polling_in_flight: false,
-                },
-                CarPhysics {
-                    http: http_state,
-                    speed: 0.0,
-                    dir_x: 1.0,
-                    dir_z: 0.0,
-                },
-            ));
+            commands
+                .spawn((
+                    Transform::from_xyz(sx, 30.0, sz),
+                    Visibility::Inherited,
+                    CarColor(car_color),
+                    CarLicense(license.clone()),
+                    PreRoad {
+                        phase: PreRoadPhase::DrivingToWait,
+                        wait_target: Vec3::new(wait_xz.x, 30.0, wait_xz.y),
+                        road_entry: Vec3::new(ex, 30.0, ez),
+                        license,
+                        car_url,
+                        register_url,
+                        validate_url,
+                        src_node_id: src.node.id.clone(),
+                        dst_node_id: city.portals[clicked_idx].node.id.clone(),
+                        polling_in_flight: false,
+                    },
+                    CarPhysics {
+                        http: http_state,
+                        speed: 0.0,
+                        dir_x: 1.0,
+                        dir_z: 0.0,
+                    },
+                ))
+                .with_children(|parent| {
+                    parent.spawn((
+                        SceneRoot(car_assets.scene.clone()),
+                        Transform::from_xyz(0.0, 0.0, 0.0).with_scale(Vec3::splat(10.0)),
+                    ));
+                    parent.spawn((Transform::IDENTITY, Pickable::IGNORE));
+                });
         }
     }
 }
@@ -367,6 +378,7 @@ fn main() {
             unfocused_mode: UpdateMode::Continuous,
         })
         .insert_resource(Orbit::default())
+        .insert_resource(OrbitMomentum::default())
         .insert_resource(PortalSelection::new())
         .insert_non_send_resource(city)
         .add_systems(Startup, setup)
@@ -378,22 +390,35 @@ fn main() {
                 update_node_labels,
                 pre_road_system,
                 update_car_physics,
+                update_car_rotation,
                 spawn_path_segments,
                 spawn_batch_button_system,
+                fix_skybox_view,
             ),
         )
         .run();
 }
 
-// Startup system that spawns all static scene geometry including road segments, portal pads, exit markers, node labels, lighting, and both the 3D orbital camera and the 2D overlay camera
-// Input: commands: Commands for spawning all scene entities; meshes: ResMut<Assets<Mesh>> for road and portal geometry; materials: ResMut<Assets<StandardMaterial>> for road, portal, and exit materials; city: NonSend<CityData> providing the full city node and portal data
+// Startup system that spawns all static scene geometry including road segments, portal pads, exit markers, node labels, lighting, and both the 3D orbital camera and the 2D overlay camera, and preloads the car FBX model into the CarAssets resource
+// Input: commands: Commands for spawning all scene entities; meshes: ResMut<Assets<Mesh>> for road and portal geometry; materials: ResMut<Assets<StandardMaterial>> for road, portal, and exit materials; city: NonSend<CityData> providing the full city node and portal data; asset_server: Res<AssetServer> for loading the car FBX model
 // Returns: none
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     city: NonSend<CityData>,
+    asset_server: Res<AssetServer>,
 ) {
+    let car_scene = asset_server.load("porsche.glb#Scene0");
+    let skybox_image =
+        asset_server.load_with_settings("skybox.png", |s: &mut ImageLoaderSettings| {
+            s.sampler = ImageSampler::linear();
+            s.array_layout = Some(ImageArrayLayout::RowCount { rows: 6 });
+        });
+    commands.insert_resource(CarAssets {
+        scene: car_scene,
+        skybox: skybox_image.clone(),
+    });
     commands.spawn(PerfUiDefaultEntries::default());
     let portal_normal_mat = materials.add(StandardMaterial {
         base_color: Color::srgb(0.3, 0.8, 0.3),
@@ -455,6 +480,61 @@ fn setup(
             ));
         }
     }
+    let (mut min_x, mut max_x, mut min_z, mut max_z) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+    for node in city.nodes.values() {
+        min_x = min_x.min(node.x);
+        max_x = max_x.max(node.x);
+        min_z = min_z.min(node.y);
+        max_z = max_z.max(node.y);
+    }
+    let pad = 200.0_f32;
+    let gx = (min_x + max_x) * 0.5;
+    let gz = (min_z + max_z) * 0.5;
+    let gw = (max_x - min_x) + pad * 2.0;
+    let gd = (max_z - min_z) + pad * 2.0;
+    let ground_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.15, 0.18, 0.12),
+        perceptual_roughness: 0.9,
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(gw, 2.0, gd))),
+        MeshMaterial3d(ground_mat.clone()),
+        Transform::from_xyz(gx, -1.0, gz),
+        Pickable::IGNORE,
+    ));
+    let wall_h = 40.0_f32;
+    let wall_t = 20.0_f32;
+    let border_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.25, 0.25, 0.28),
+        perceptual_roughness: 0.7,
+        ..default()
+    });
+    let wall_y = wall_h * 0.5;
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(gw + wall_t * 2.0, wall_h, wall_t))),
+        MeshMaterial3d(border_mat.clone()),
+        Transform::from_xyz(gx, wall_y, gz - gd * 0.5 - wall_t * 0.5),
+        Pickable::IGNORE,
+    ));
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(gw + wall_t * 2.0, wall_h, wall_t))),
+        MeshMaterial3d(border_mat.clone()),
+        Transform::from_xyz(gx, wall_y, gz + gd * 0.5 + wall_t * 0.5),
+        Pickable::IGNORE,
+    ));
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(wall_t, wall_h, gd))),
+        MeshMaterial3d(border_mat.clone()),
+        Transform::from_xyz(gx - gw * 0.5 - wall_t * 0.5, wall_y, gz),
+        Pickable::IGNORE,
+    ));
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(wall_t, wall_h, gd))),
+        MeshMaterial3d(border_mat.clone()),
+        Transform::from_xyz(gx + gw * 0.5 + wall_t * 0.5, wall_y, gz),
+        Pickable::IGNORE,
+    ));
     for (portal_index, portal) in city.portals.iter().enumerate() {
         let [cx, cz] = portal.center;
         let (ex, ez) = (portal.node.x, portal.node.y);
@@ -496,7 +576,6 @@ fn setup(
             NodeLabel { world_pos },
         ));
     }
-
     commands.spawn(AmbientLight {
         color: Color::WHITE,
         brightness: 500.0,
@@ -516,6 +595,11 @@ fn setup(
         Camera {
             order: 0,
             ..default()
+        },
+        Skybox {
+            image: skybox_image.clone(),
+            brightness: 1000.0,
+            rotation: Quat::IDENTITY,
         },
         Transform::from_translation(pos).looking_at(Vec3::ZERO, Vec3::Y),
     ));
@@ -542,6 +626,13 @@ fn setup(
             },
             Button,
             SpawnBatchButton,
+            BorderColor {
+                top: Color::srgb(0.6, 0.6, 0.7),
+                right: Color::srgb(0.6, 0.6, 0.7),
+                bottom: Color::srgb(0.6, 0.6, 0.7),
+                left: Color::srgb(0.6, 0.6, 0.7),
+            },
+            BackgroundColor(Color::srgba(0.1, 0.1, 0.15, 0.85)),
         ))
         .with_children(|parent| {
             parent.spawn((
@@ -555,9 +646,41 @@ fn setup(
         });
 }
 
+// Waits for the skybox image to finish loading then sets its texture view dimension to Cube so the GPU binds it correctly; runs every frame but exits immediately once the descriptor is set
+// Input: car_assets: Res<CarAssets> holding the skybox handle; images: ResMut<Assets<Image>> for mutating the loaded image
+// Returns: none
+fn fix_skybox_view(car_assets: Res<CarAssets>, mut images: ResMut<Assets<Image>>) {
+    if let Some(image) = images.get_mut(&car_assets.skybox) {
+        if image
+            .texture_view_descriptor
+            .as_ref()
+            .map(|d| d.dimension == Some(TextureViewDimension::Cube))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        image.texture_view_descriptor = Some(TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::Cube),
+            ..default()
+        });
+    }
+}
+
 // Marker component added to a car entity once its path segment meshes have been spawned, preventing the segments from being created more than once
 #[derive(Component)]
 struct PathRendered;
+
+// Rotates each active roadway car each frame to face the direction it is currently moving, reading dir_x and dir_z from CarPhysics and delegating to car_facing_quat for the angle calculation
+// Input: q: Query over entities with Transform and CarPhysics but without PreRoad, covering all cars currently on the roadway
+// Returns: none
+fn update_car_rotation(mut q: Query<(&mut Transform, &CarPhysics), Without<PreRoad>>) {
+    for (mut transform, physics) in q.iter_mut() {
+        if physics.speed < 0.1 {
+            continue;
+        }
+        transform.rotation = car_facing_quat(physics.dir_x, physics.dir_z);
+    }
+}
 
 // Spawns colored road segment meshes along each active car's assigned waypoint path, then marks the car entity so segments are not spawned again next frame
 // Input: commands: Commands for spawning segment entities and inserting PathRendered; meshes, materials: asset resources for building segment geometry; q: Query over cars that are on the roadway, have a color, and have not yet had their path rendered
@@ -615,13 +738,12 @@ fn spawn_path_segments(
 }
 
 // Responds to presses of the batch spawn button by picking up to BATCH_SPAWN_COUNT random unique portal pairs, skipping any routes already in use, and spawning a car for each valid pair
-// Input: commands: Commands for spawning car entities; meshes, materials: asset resources for car geometry; interaction_q: Query for detecting button press interactions; city: NonSend<CityData> for portal data; selection: ResMut<PortalSelection> for car ID and port counters; existing_cars: Query<&PreRoad> to avoid duplicate routes
+// Input: commands: Commands for spawning car entities; interaction_q: Query for detecting button press interactions; car_assets: Res<CarAssets> for the shared car scene handle; city: NonSend<CityData> for portal data; selection: ResMut<PortalSelection> for car ID and port counters; existing_cars: Query<&PreRoad> to avoid duplicate routes
 // Returns: none
 fn spawn_batch_button_system(
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     interaction_q: Query<&Interaction, (Changed<Interaction>, With<SpawnBatchButton>)>,
+    car_assets: Res<CarAssets>,
     city: NonSend<CityData>,
     mut selection: ResMut<PortalSelection>,
     existing_cars: Query<&PreRoad>,
@@ -687,46 +809,44 @@ fn spawn_batch_button_system(
         let register_url = format!("{}{}", SERVER_URL, REGISTER_CAR_ENDPOINT);
         let validate_url = format!("{}{}", SERVER_URL, VALIDATE_ENTRY_ENDPOINT);
         let car_color = rand_car_color();
-        let car_mat = materials.add(StandardMaterial {
-            base_color: car_color,
-            emissive: {
-                let lc = car_color.to_linear();
-                LinearRgba::new(lc.red * 0.8, lc.green * 0.8, lc.blue * 0.8, 1.0)
-            },
-            ..default()
-        });
         println!(
             "Batch spawning {} port {} : {} -> {}",
             license, port, src_idx, dst_idx
         );
         let http_state = Arc::new(Mutex::new(CarHttp::new(sx, sz)));
         spawn_car_listener(port, Arc::clone(&http_state));
-        let car_mesh = meshes.add(Sphere::new(25.0));
-        commands.spawn((
-            Mesh3d(car_mesh),
-            MeshMaterial3d(car_mat),
-            Transform::from_xyz(sx, 30.0, sz),
-            CarColor(car_color),
-            CarLicense(license.clone()),
-            PreRoad {
-                phase: PreRoadPhase::DrivingToWait,
-                wait_target: Vec3::new(wait_xz.x, 30.0, wait_xz.y),
-                road_entry: Vec3::new(ex, 30.0, ez),
-                license,
-                car_url,
-                register_url,
-                validate_url,
-                src_node_id: src_id,
-                dst_node_id: dst_id,
-                polling_in_flight: false,
-            },
-            CarPhysics {
-                http: http_state,
-                speed: 0.0,
-                dir_x: 1.0,
-                dir_z: 0.0,
-            },
-        ));
+        commands
+            .spawn((
+                Transform::from_xyz(sx, 30.0, sz),
+                Visibility::Inherited,
+                CarColor(car_color),
+                CarLicense(license.clone()),
+                PreRoad {
+                    phase: PreRoadPhase::DrivingToWait,
+                    wait_target: Vec3::new(wait_xz.x, 30.0, wait_xz.y),
+                    road_entry: Vec3::new(ex, 30.0, ez),
+                    license,
+                    car_url,
+                    register_url,
+                    validate_url,
+                    src_node_id: src_id,
+                    dst_node_id: dst_id,
+                    polling_in_flight: false,
+                },
+                CarPhysics {
+                    http: http_state,
+                    speed: 0.0,
+                    dir_x: 1.0,
+                    dir_z: 0.0,
+                },
+            ))
+            .with_children(|parent| {
+                parent.spawn((
+                    SceneRoot(car_assets.scene.clone()),
+                    Transform::from_xyz(0.0, 0.0, 0.0).with_scale(Vec3::splat(10.0)),
+                ));
+                parent.spawn((Transform::IDENTITY, Pickable::IGNORE));
+            });
         spawned += 1;
     }
     println!(

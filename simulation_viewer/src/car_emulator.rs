@@ -182,6 +182,14 @@ pub fn update_car_physics(
     }
 }
 
+// Computes the Y-axis rotation quaternion for a movement direction vector, applying the same offset used by update_car_rotation so pre-road and on-road cars rotate identically; exported as pub so main.rs can call it from update_car_rotation without duplicating the angle formula
+// Input: dir_x: f32 normalized X component of the movement direction; dir_z: f32 normalized Z component of the movement direction
+// Returns: Quat representing the correct Y-axis rotation for a car moving in the given direction
+pub fn car_facing_quat(dir_x: f32, dir_z: f32) -> Quat {
+    let angle = dir_z.atan2(dir_x);
+    Quat::from_rotation_y(-angle + std::f32::consts::FRAC_PI_2)
+}
+
 // Formats a minimal HTTP response string with the given status line and plain text body
 // Input: status: &str HTTP status line such as "200 OK"; body: &str plain text response body
 // Returns: String containing a complete HTTP/1.1 response ready to write to a TCP stream
@@ -273,7 +281,7 @@ pub fn spawn_car_listener(port: u16, state: Arc<Mutex<CarHttp>>) {
     });
 }
 
-// Drives the pre-road state machine for all cars not yet on the roadway, handling both driving to the wait position and polling the server for entry approval, and removing the PreRoad component once entry is granted
+// Drives the pre-road state machine for all cars not yet on the roadway, handling both driving to the wait position and polling the server for entry approval, and removing the PreRoad component once entry is granted; rotates the car model to face its current movement direction during DrivingToWait using the same angle formula as update_car_rotation
 // Input: commands: Commands for removing the PreRoad component; time: Res<Time> for the frame delta; city: NonSend<CityData> for resolving waypoint coordinates; q: Query over entities with Transform, CarPhysics, and PreRoad
 // Returns: none
 pub fn pre_road_system(
@@ -330,6 +338,7 @@ pub fn pre_road_system(
                     let dir = diff.normalize();
                     transform.translation.x += dir.x * physics.speed * dt;
                     transform.translation.z += dir.y * physics.speed * dt;
+                    transform.rotation = car_facing_quat(dir.x, dir.y);
                     let mut h = physics.http.lock().unwrap();
                     h.pos_x = transform.translation.x;
                     h.pos_z = transform.translation.z;

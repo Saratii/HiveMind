@@ -41,7 +41,8 @@ use crate::{
 };
 
 const CITY_JSON_PATH: &str = "../city.json";
-const SERVER_URL: &str = "http://127.0.0.1:8080";
+// const SERVER_URL: &str = "http://127.0.0.1:8080";
+const SERVER_URL: &str = "http://52.15.156.213:8080";
 const REGISTER_CAR_ENDPOINT: &str = "/register-car";
 const VALIDATE_ENTRY_ENDPOINT: &str = "/validate-entry";
 const ACCELERATION: f32 = 50.0;
@@ -111,6 +112,20 @@ fn parse_form(body: &str) -> HashMap<String, String> {
             Some((k, v))
         })
         .collect()
+}
+
+// Determines the local IP address that the OS would use to reach the remote server by opening a
+// non-sending UDP socket toward it and reading back the chosen local address; this is the IP the
+// remote server must use to call back into the car's HTTP listener
+// Input: none
+// Returns: String containing the local IP address as a dotted-decimal string
+fn local_ip() -> String {
+    use std::net::UdpSocket;
+    let socket = UdpSocket::bind("0.0.0.0:0").expect("bind UDP for IP detection");
+    socket
+        .connect("52.15.156.213:8080")
+        .expect("connect UDP for IP detection");
+    socket.local_addr().expect("local_addr").ip().to_string()
 }
 
 // Bevy resource storing the camera's current orbital state relative to a fixed focus point
@@ -301,7 +316,7 @@ fn on_portal_click(
             let port = selection.next_port;
             selection.next_port += 1;
             let license = format!("CAR-{:03}", i);
-            let car_url = format!("http://127.0.0.1:{}", port);
+            let car_url = format!("http://{}:{}", local_ip(), port);
             let register_url = format!("{}{}", SERVER_URL, REGISTER_CAR_ENDPOINT);
             let validate_url = format!("{}{}", SERVER_URL, VALIDATE_ENTRY_ENDPOINT);
             let car_color = rand_car_color();
@@ -805,7 +820,7 @@ fn spawn_batch_button_system(
         let port = selection.next_port;
         selection.next_port += 1;
         let license = format!("CAR-{:03}", i);
-        let car_url = format!("http://127.0.0.1:{}", port);
+        let car_url = format!("http://{}:{}", local_ip(), port);
         let register_url = format!("{}{}", SERVER_URL, REGISTER_CAR_ENDPOINT);
         let validate_url = format!("{}{}", SERVER_URL, VALIDATE_ENTRY_ENDPOINT);
         let car_color = rand_car_color();

@@ -43,8 +43,8 @@ use crate::{
 };
 
 const CITY_JSON_PATH: &str = "../city.json";
-const SERVER_URL: &str = "http://127.0.0.1:8080";
-// const SERVER_URL: &str = "http://52.15.156.213:8080";
+// const SERVER_URL: &str = "http://127.0.0.1:8080";
+const SERVER_URL: &str = "http://52.15.156.213:8080";
 const REGISTER_CAR_ENDPOINT: &str = "/register-car";
 const VALIDATE_ENTRY_ENDPOINT: &str = "/validate-entry";
 const ACCELERATION: f32 = 50.0;

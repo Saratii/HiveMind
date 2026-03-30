@@ -4,8 +4,8 @@ Name of program: main.rs
 Description: Main file for the rendering. Sets up a bevy app with various game display elements.
 Author: Maren Proplesch
 Date Created: 3/13/2026
-Date Revised: 3/13/2026
-Revision History: None
+Date Revised: 3/29/2026
+Revision History: Spawn calls routed through CarSpawnQueue for gap-based spacing.
 Preconditions: Not applicable/Redundant
 Postconditions: Not applicable/Redundant
 Citation: Used AI copilot for limited code generation - claude.ai
@@ -30,14 +30,12 @@ use iyes_perf_ui::PerfUiPlugin;
 use iyes_perf_ui::prelude::PerfUiDefaultEntries;
 use std::collections::{HashMap, HashSet};
 use std::f32::consts::PI;
-use std::sync::{Arc, Mutex};
 
 use crate::{
     cameras::{CameraMode, FlyCamState, OrbitMomentum, flycam_system, orbit_camera, zoom_camera},
     car_emulator::{
-        CarHttp, CarLicense, CarPhysics, ParkingIn, PostRoad, PreRoad, PreRoadPhase,
-        car_facing_quat, parking_in_system, pre_road_system, spawn_car_listener,
-        update_car_physics,
+        CarLicense, CarPhysics, CarSpawnQueue, ParkingIn, PreRoad, QueuedCar, car_facing_quat,
+        car_spawn_queue_system, parking_in_system, pre_road_system, update_car_physics,
     },
     map_parser::{CityData, PortalMarker, Waypoint, parse_city},
 };
@@ -95,9 +93,9 @@ struct PortalMaterials {
 // hitbox_mat: handle to a semi-transparent red material applied to the hitbox mesh so it is visible over the road
 // skybox: handle to the column PNG image so the fix_skybox_view system can set its texture view dimension to Cube after load
 #[derive(Resource)]
-struct CarAssets {
-    scene: Handle<Scene>,
-    skybox: Handle<Image>,
+pub struct CarAssets {
+    pub scene: Handle<Scene>,
+    pub skybox: Handle<Image>,
 }
 
 // Marker component attached to the UI button that triggers a batch spawn of randomly routed cars
@@ -111,7 +109,7 @@ struct ToggleFlyCamButton;
 // Parses a URL-encoded form body string into a key-value map, trimming whitespace from both keys and values
 // Input: body: &str containing the raw URL-encoded form data
 // Returns: HashMap<String, String> mapping each field name to its value
-fn parse_form(body: &str) -> HashMap<String, String> {
+pub fn parse_form(body: &str) -> HashMap<String, String> {
     body.split('&')
         .filter_map(|pair| {
             let mut kv = pair.splitn(2, '=');
@@ -166,7 +164,7 @@ impl Default for Orbit {
 // Computes the world space camera position for a given orbital state using spherical coordinates
 // Input: o: &Orbit containing the current yaw, pitch, radius, and focus
 // Returns: Vec3 representing the camera's position in world space
-fn orbit_pos(o: &Orbit) -> Vec3 {
+pub fn orbit_pos(o: &Orbit) -> Vec3 {
     o.focus
         + Vec3::new(
             o.radius * o.pitch.cos() * o.yaw.sin(),
@@ -178,7 +176,7 @@ fn orbit_pos(o: &Orbit) -> Vec3 {
 // ECS component storing the display color assigned to a car, used when rendering its path segments
 // 0: the Bevy Color value assigned to this car at spawn time
 #[derive(Component, Clone, Copy)]
-struct CarColor(Color);
+pub struct CarColor(pub Color);
 
 // Generates a unique fully saturated random hue color for each car by combining a monotonic counter with the current system nanoseconds to seed an LCG
 // Input: none
@@ -254,16 +252,74 @@ fn right_lane_offset(dir: Vec2) -> Vec2 {
     right * (ROAD_WIDTH * 0.25)
 }
 
-// Handles primary click events on portal entities, managing a two-click selection flow where the first click highlights the source portal and the second click spawns a car routed between the two selected portals
-// Input: event: On<Pointer<Click>> carrying the clicked entity and button; commands: Commands for spawning the car entity; portal_mats: Res<PortalMaterials> for highlight toggling; car_assets: Res<CarAssets> for the shared car scene handle; city: NonSend<CityData> for portal coordinates and node IDs; selection: ResMut<PortalSelection> tracking current selection state; portal_markers: Query<&PortalMarker> to read the clicked portal's index; existing_cars: Query<&PreRoad> to prevent duplicate routes; mat_handles: Query for mutating portal mesh materials
+// Builds a QueuedCar from portal indices and pushes it onto the CarSpawnQueue; shared by both the single-click portal handler and the batch spawn button so spawn logic is not duplicated
+// Input: src_idx: usize index of the source portal; dst_idx: usize index of the destination portal; city: &CityData; selection: &mut PortalSelection for car ID and port counters; queue: &mut CarSpawnQueue
+// Returns: none
+fn enqueue_car(
+    src_idx: usize,
+    dst_idx: usize,
+    city: &CityData,
+    selection: &mut PortalSelection,
+    queue: &mut CarSpawnQueue,
+) {
+    let src = &city.portals[src_idx];
+    let [sx, sz] = src.center;
+    let (ex, ez) = (src.node.x, src.node.y);
+    let center_xz = Vec2::new(sx, sz);
+    let exit_xz = Vec2::new(ex, ez);
+    let to_exit = exit_xz - center_xz;
+    let wait_xz = if to_exit.length() > 3.0 {
+        exit_xz - to_exit.normalize() * 3.0
+    } else {
+        center_xz
+    };
+    let travel_dir = if to_exit.length() > 1e-6 {
+        to_exit.normalize()
+    } else {
+        Vec2::X
+    };
+    let lane_offset = right_lane_offset(travel_dir);
+    let spawn_xz = Vec2::new(sx, sz) + lane_offset;
+    let wait_xz_offset = wait_xz + lane_offset;
+    let road_entry_xz = exit_xz + lane_offset;
+    let i = selection.next_car_id;
+    selection.next_car_id += 1;
+    let port = selection.next_port;
+    selection.next_port += 1;
+    let license = format!("CAR-{:03}", i);
+    let car_url = format!("http://{}:{}", local_ip(), port);
+    let register_url = format!("{}{}", SERVER_URL, REGISTER_CAR_ENDPOINT);
+    let validate_url = format!("{}{}", SERVER_URL, VALIDATE_ENTRY_ENDPOINT);
+    let car_color = rand_car_color();
+    println!(
+        "Queuing {} port {} : portal {} -> portal {}",
+        license, port, src_idx, dst_idx
+    );
+    queue.queue.push_back(QueuedCar {
+        spawn_xz,
+        wait_xz_offset,
+        road_entry_xz,
+        license,
+        car_url,
+        register_url,
+        validate_url,
+        src_node_id: src.node.id.clone(),
+        dst_node_id: city.portals[dst_idx].node.id.clone(),
+        dst_center: city.portals[dst_idx].center,
+        car_color,
+        port,
+    });
+}
+
+// Handles primary click events on portal entities, managing a two-click selection flow where the first click highlights the source portal and the second click enqueues a car routed between the two selected portals
+// Input: event: On<Pointer<Click>> carrying the clicked entity and button; portal_mats: Res<PortalMaterials> for highlight toggling; city: NonSend<CityData> for portal coordinates and node IDs; selection: ResMut<PortalSelection> tracking current selection state; queue: ResMut<CarSpawnQueue> for enqueuing the new car; portal_markers: Query<&PortalMarker> to read the clicked portal's index; existing_cars: Query<&PreRoad> to prevent duplicate routes; mat_handles: Query for mutating portal mesh materials
 // Returns: none
 fn on_portal_click(
     event: On<Pointer<Click>>,
-    mut commands: Commands,
     portal_mats: Res<PortalMaterials>,
-    car_assets: Res<CarAssets>,
     city: NonSend<CityData>,
     mut selection: ResMut<PortalSelection>,
+    mut queue: ResMut<CarSpawnQueue>,
     portal_markers: Query<&PortalMarker>,
     existing_cars: Query<&PreRoad>,
     mut mat_handles: Query<&mut MeshMaterial3d<StandardMaterial>>,
@@ -306,77 +362,7 @@ fn on_portal_click(
                 );
                 return;
             }
-            let src = &city.portals[src_idx];
-            let [sx, sz] = src.center;
-            let (ex, ez) = (src.node.x, src.node.y);
-            let center_xz = Vec2::new(sx, sz);
-            let exit_xz = Vec2::new(ex, ez);
-            let to_exit = exit_xz - center_xz;
-            let wait_xz = if to_exit.length() > 3.0 {
-                exit_xz - to_exit.normalize() * 3.0
-            } else {
-                center_xz
-            };
-            let travel_dir = if to_exit.length() > 1e-6 {
-                to_exit.normalize()
-            } else {
-                Vec2::X
-            };
-            let lane_offset = right_lane_offset(travel_dir);
-            let spawn_xz = Vec2::new(sx, sz) + lane_offset;
-            let wait_xz_offset = wait_xz + lane_offset;
-            let road_entry_xz = exit_xz + lane_offset;
-            let i = selection.next_car_id;
-            selection.next_car_id += 1;
-            let port = selection.next_port;
-            selection.next_port += 1;
-            let license = format!("CAR-{:03}", i);
-            let car_url = format!("http://{}:{}", local_ip(), port);
-            let register_url = format!("{}{}", SERVER_URL, REGISTER_CAR_ENDPOINT);
-            let validate_url = format!("{}{}", SERVER_URL, VALIDATE_ENTRY_ENDPOINT);
-            let car_color = rand_car_color();
-            println!(
-                "Spawning {} on port {} from portal {} to portal {}",
-                license, port, src_idx, clicked_idx
-            );
-            let dst_center = city.portals[clicked_idx].center;
-            let http_state = Arc::new(Mutex::new(CarHttp::new(spawn_xz.x, spawn_xz.y)));
-            spawn_car_listener(port, Arc::clone(&http_state));
-            commands
-                .spawn((
-                    Transform::from_xyz(spawn_xz.x, 13.5, spawn_xz.y),
-                    Visibility::Inherited,
-                    CarColor(car_color),
-                    CarLicense(license.clone()),
-                    PreRoad {
-                        phase: PreRoadPhase::DrivingToWait,
-                        wait_target: Vec3::new(wait_xz_offset.x, 13.5, wait_xz_offset.y),
-                        road_entry: Vec3::new(road_entry_xz.x, 13.5, road_entry_xz.y),
-                        license,
-                        car_url,
-                        register_url,
-                        validate_url,
-                        src_node_id: src.node.id.clone(),
-                        dst_node_id: city.portals[clicked_idx].node.id.clone(),
-                        polling_in_flight: false,
-                    },
-                    PostRoad {
-                        center: Vec3::new(dst_center[0], 13.5, dst_center[1]),
-                    },
-                    CarPhysics {
-                        http: http_state,
-                        speed: 0.0,
-                        dir_x: 1.0,
-                        dir_z: 0.0,
-                    },
-                ))
-                .with_children(|parent| {
-                    parent.spawn((
-                        SceneRoot(car_assets.scene.clone()),
-                        Transform::from_xyz(0.0, 0.0, 0.0).with_scale(Vec3::splat(CAR_SCALE)),
-                    ));
-                    parent.spawn((Transform::IDENTITY, Pickable::IGNORE));
-                });
+            enqueue_car(src_idx, clicked_idx, &city, &mut selection, &mut queue);
         }
     }
 }
@@ -416,6 +402,7 @@ fn main() {
         .insert_resource(CameraMode::default())
         .insert_resource(FlyCamState::default())
         .insert_resource(PortalSelection::new())
+        .insert_resource(CarSpawnQueue::default())
         .insert_non_send_resource(city)
         .add_systems(Startup, setup)
         .add_systems(
@@ -426,6 +413,7 @@ fn main() {
                 flycam_system,
                 toggle_flycam_system,
                 update_node_labels,
+                car_spawn_queue_system,
                 pre_road_system,
                 update_car_physics,
                 parking_in_system,
@@ -1014,15 +1002,14 @@ fn toggle_flycam_system(
     }
 }
 
-// Responds to presses of the batch spawn button by picking up to BATCH_SPAWN_COUNT random unique portal pairs, skipping any routes already in use, and spawning a car for each valid pair
-// Input: commands: Commands for spawning car entities; interaction_q: Query for detecting button press interactions; car_assets: Res<CarAssets> for the shared car scene handle; city: NonSend<CityData> for portal data; selection: ResMut<PortalSelection> for car ID and port counters; existing_cars: Query<&PreRoad> to avoid duplicate routes
+// Responds to presses of the batch spawn button by picking up to BATCH_SPAWN_COUNT random unique portal pairs, skipping any routes already in use, and enqueuing a car for each valid pair
+// Input: interaction_q: Query for detecting button press interactions; city: NonSend<CityData> for portal data; selection: ResMut<PortalSelection> for car ID and port counters; queue: ResMut<CarSpawnQueue> for enqueuing new cars; existing_cars: Query<&PreRoad> to avoid duplicate routes
 // Returns: none
 fn spawn_batch_button_system(
-    mut commands: Commands,
     interaction_q: Query<&Interaction, (Changed<Interaction>, With<SpawnBatchButton>)>,
-    car_assets: Res<CarAssets>,
     city: NonSend<CityData>,
     mut selection: ResMut<PortalSelection>,
+    mut queue: ResMut<CarSpawnQueue>,
     existing_cars: Query<&PreRoad>,
 ) {
     let clicked = interaction_q.iter().any(|i| *i == Interaction::Pressed);
@@ -1038,6 +1025,9 @@ fn spawn_batch_button_system(
         .iter()
         .map(|p| (p.src_node_id.clone(), p.dst_node_id.clone()))
         .collect();
+    for qc in queue.queue.iter() {
+        used.insert((qc.src_node_id.clone(), qc.dst_node_id.clone()));
+    }
     let mut rng_seed: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as u64)
@@ -1066,81 +1056,11 @@ fn spawn_batch_button_system(
             continue;
         }
         used.insert(route_key);
-        let src = &portals[src_idx];
-        let [sx, sz] = src.center;
-        let (ex, ez) = (src.node.x, src.node.y);
-        let center_xz = Vec2::new(sx, sz);
-        let exit_xz = Vec2::new(ex, ez);
-        let to_exit = exit_xz - center_xz;
-        let wait_xz = if to_exit.length() > 3.0 {
-            exit_xz - to_exit.normalize() * 3.0
-        } else {
-            center_xz
-        };
-        let travel_dir = if to_exit.length() > 1e-6 {
-            to_exit.normalize()
-        } else {
-            Vec2::X
-        };
-        let lane_offset = right_lane_offset(travel_dir);
-        let spawn_xz = Vec2::new(sx, sz) + lane_offset;
-        let wait_xz_offset = wait_xz + lane_offset;
-        let road_entry_xz = exit_xz + lane_offset;
-        let i = selection.next_car_id;
-        selection.next_car_id += 1;
-        let port = selection.next_port;
-        selection.next_port += 1;
-        let license = format!("CAR-{:03}", i);
-        let car_url = format!("http://{}:{}", local_ip(), port);
-        let register_url = format!("{}{}", SERVER_URL, REGISTER_CAR_ENDPOINT);
-        let validate_url = format!("{}{}", SERVER_URL, VALIDATE_ENTRY_ENDPOINT);
-        let car_color = rand_car_color();
-        println!(
-            "Batch spawning {} port {} : {} -> {}",
-            license, port, src_idx, dst_idx
-        );
-        let dst_center = portals[dst_idx].center;
-        let http_state = Arc::new(Mutex::new(CarHttp::new(spawn_xz.x, spawn_xz.y)));
-        spawn_car_listener(port, Arc::clone(&http_state));
-        commands
-            .spawn((
-                Transform::from_xyz(spawn_xz.x, 13.5, spawn_xz.y),
-                Visibility::Inherited,
-                CarColor(car_color),
-                CarLicense(license.clone()),
-                PreRoad {
-                    phase: PreRoadPhase::DrivingToWait,
-                    wait_target: Vec3::new(wait_xz_offset.x, 13.5, wait_xz_offset.y),
-                    road_entry: Vec3::new(road_entry_xz.x, 13.5, road_entry_xz.y),
-                    license,
-                    car_url,
-                    register_url,
-                    validate_url,
-                    src_node_id: src_id,
-                    dst_node_id: dst_id,
-                    polling_in_flight: false,
-                },
-                PostRoad {
-                    center: Vec3::new(dst_center[0], 13.5, dst_center[1]),
-                },
-                CarPhysics {
-                    http: http_state,
-                    speed: 0.0,
-                    dir_x: 1.0,
-                    dir_z: 0.0,
-                },
-            ))
-            .with_children(|parent| {
-                parent.spawn((
-                    SceneRoot(car_assets.scene.clone()),
-                    Transform::from_xyz(0.0, 0.0, 0.0).with_scale(Vec3::splat(CAR_SCALE)),
-                ));
-                parent.spawn((Transform::IDENTITY, Pickable::IGNORE));
-            });
+        enqueue_car(src_idx, dst_idx, &city, &mut selection, &mut queue);
         spawned += 1;
     }
     println!(
-        "Batch spawn: {} cars spawned ({} attempts)",
+        "Batch spawn: {} cars queued ({} attempts)",
         spawned, attempts
     );
 }

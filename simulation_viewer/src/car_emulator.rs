@@ -28,15 +28,17 @@ use crate::{
     parse_form,
 };
 
+// Radius in world units around a queued car's spawn point that must be clear of other pre-road cars before it is released
 const SPAWN_CLEAR_RADIUS: f32 = 30.0;
+
+// Distance in world units ahead of a car within which another car triggers speed matching
 const FOLLOW_DISTANCE: f32 = 120.0;
+
+// Minimum speed fraction of the target speed that following will clamp down to, preventing cars from stopping completely due to following alone
 const FOLLOW_MIN_FRACTION: f32 = 0.15;
 
 // Holds the complete set of arguments needed to spawn a single car entity, queued when the user requests a spawn and released one at a time with spacing
-// portal_index: index of the source portal this car belongs to, used to route it into the correct per-portal sub-queue
-// is_ambulance: when true the car uses ambulance.glb instead of the default model, assigned with a 1-in-10 probability at enqueue time
 pub struct QueuedCar {
-    pub portal_index: usize,
     pub spawn_xz: Vec2,
     pub wait_xz_offset: Vec2,
     pub road_entry_xz: Vec2,
@@ -49,14 +51,13 @@ pub struct QueuedCar {
     pub dst_center: [f32; 2],
     pub car_color: Color,
     pub port: u16,
-    pub is_ambulance: bool,
 }
 
-// Shared resource holding one independent VecDeque per source portal so cars queued at different
-// portals never block each other; the key is the portal index into CityData::portals
+// Shared resource holding pending car spawns; entries are released one at a time as soon as the spawn point is clear of other pre-road cars
+// queue: ordered list of cars waiting to be spawned
 #[derive(Resource, Default)]
 pub struct CarSpawnQueue {
-    pub queues: HashMap<usize, VecDeque<QueuedCar>>,
+    pub queue: std::collections::VecDeque<QueuedCar>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -122,13 +123,9 @@ pub struct CarLicense(pub String);
 #[derive(Component)]
 pub struct ParkingIn;
 
-// Displaces waypoints into the right lane using per-segment perpendiculars averaged at corners; for
-// a forward direction (dx, dz) the right lane in Bevy's Y-up right-handed XZ plane is the
-// left-hand perpendicular (-dz, dx)/mag — a car moving in +X has its right lane in -Z, and
-// (-dz/mag, dx/mag) gives (0, -1) for (dx=1,dz=0), which is the -Z offset that places it in the
-// right lane when viewed from above with +X pointing right and +Z pointing toward the viewer
+// Displaces waypoints into the right lane using per-segment perpendiculars averaged at corners; for each segment the canonical right direction is derived from the lexicographically-lower node ID toward the higher one, then the sign is chosen so that a car travelling from lower-ID to higher-ID gets the positive-right offset and a car travelling the reverse gets the same absolute world-space side — ensuring two cars on the same road in opposite directions never end up in the same lane
 // Input: waypoints: Vec<Waypoint> centerline waypoints parsed from the server response
-// Returns: Vec<Waypoint> with x and z fields shifted by ROAD_WIDTH * 0.25 into the right lane
+// Returns: Vec<Waypoint> with x and z fields shifted by ROAD_WIDTH * 0.25 to the consistent right lane
 fn offset_waypoints_to_right_lane(waypoints: Vec<Waypoint>) -> Vec<Waypoint> {
     let n = waypoints.len();
     if n < 2 {
@@ -142,7 +139,13 @@ fn offset_waypoints_to_right_lane(waypoints: Vec<Waypoint>) -> Vec<Waypoint> {
             if mag < 1e-6 {
                 return Vec2::ZERO;
             }
-            Vec2::new(-dz / mag, dx / mag)
+            let raw_right = Vec2::new(dz / mag, -dx / mag);
+            let forward_sign = if waypoints[i].node_id <= waypoints[i + 1].node_id {
+                1.0_f32
+            } else {
+                -1.0_f32
+            };
+            raw_right * forward_sign
         })
         .collect();
     let shift = ROAD_WIDTH * 0.25;
@@ -166,12 +169,9 @@ fn offset_waypoints_to_right_lane(waypoints: Vec<Waypoint>) -> Vec<Waypoint> {
     result
 }
 
-// Computes a following-adjusted speed by scanning the pre-built slice of other car positions and
-// directions, skipping oncoming traffic (dot product below 0.5) and cars that are behind, then
-// blending between closest_speed and target_speed proportionally to the gap fraction so cars
-// smoothly decelerate as they close in rather than snapping to a fixed speed
-// Input: pos_x, pos_z: f32 current position; dir_x, dir_z: f32 normalized movement direction; target_speed: f32 server-assigned speed; others: &[(f32, f32, f32, f32)] positions and directions of all other active cars
-// Returns: f32 the gap-blended speed, clamped to at least FOLLOW_MIN_FRACTION of target_speed
+// Computes a following-adjusted speed for a car by scanning all other active cars and finding the closest one within FOLLOW_DISTANCE that is ahead and travelling in roughly the same direction; oncoming cars (direction dot product below 0.5) are ignored entirely
+// Input: pos_x: f32 current X position of the subject car; pos_z: f32 current Z position; dir_x: f32 normalized movement direction X; dir_z: f32 normalized movement direction Z; target_speed: f32 the server-assigned target speed; others: &[(f32, f32, f32, f32)] positions and directions of all other cars
+// Returns: f32 the adjusted speed after applying car-following, clamped to at least FOLLOW_MIN_FRACTION of target_speed
 fn following_speed(
     pos_x: f32,
     pos_z: f32,
@@ -207,11 +207,7 @@ fn following_speed(
     blended.max(target_speed * FOLLOW_MIN_FRACTION)
 }
 
-// Advances the physics simulation for all active roadway cars each frame; reads target speed,
-// stopped flag, wp_index, and wp_count from CarHttp in a single lock acquisition per car to
-// minimize mutex contention, then writes pos_x/pos_z back in a second acquisition only after
-// position is updated; applies car-following speed adjustment against a snapshot of all car
-// positions built once before the per-car loop to avoid re-querying the query inside the loop
+// Advances the physics simulation for all active roadway cars each frame, steering each car toward its next waypoint, applying acceleration, applying car-following speed adjustment, transitioning to the parking drive-in once the route ends, and despawning once fully stopped after route completion without a parking target
 // Input: commands: Commands for despawning entities; time: Res<Time> for the frame delta; q: Query over car entities on the roadway that are not yet parking; path_segs: Query over path segment entities for cleanup on despawn
 // Returns: none
 pub fn update_car_physics(
@@ -269,20 +265,24 @@ pub fn update_car_physics(
             }
             continue;
         }
-        let self_x = transform.translation.x;
-        let self_z = transform.translation.z;
+        let self_pos = (
+            transform.translation.x,
+            transform.translation.z,
+            physics.dir_x,
+            physics.dir_z,
+        );
         let others_excluding_self: Vec<(f32, f32, f32, f32)> = others
             .iter()
             .copied()
             .filter(|&o| {
-                let dx = o.0 - self_x;
-                let dz = o.1 - self_z;
+                let dx = o.0 - self_pos.0;
+                let dz = o.1 - self_pos.1;
                 dx * dx + dz * dz > 1.0
             })
             .collect();
         let adjusted_speed = following_speed(
-            self_x,
-            self_z,
+            transform.translation.x,
+            transform.translation.z,
             physics.dir_x,
             physics.dir_z,
             target_speed,
@@ -463,11 +463,8 @@ pub fn spawn_car_listener(port: u16, state: Arc<Mutex<CarHttp>>) {
     });
 }
 
-// Iterates every per-portal sub-queue independently each frame; for each portal checks whether any
-// existing pre-road car is within SPAWN_CLEAR_RADIUS of that portal's spawn point and skips it if
-// blocked, otherwise pops and spawns the front entry; portals with empty queues are skipped
-// immediately so the cost scales with the number of portals that actually have pending cars
-// Input: commands: Commands for spawning car entities; car_assets: Res<CarAssets> for the shared scene handles; queue: ResMut<CarSpawnQueue> holding per-portal pending spawns; pre_road_q: Query<&Transform> over all pre-road cars to check for occupancy at each spawn point
+// Drains one car per frame from CarSpawnQueue when no existing pre-road car is within SPAWN_CLEAR_RADIUS of the next car's spawn point, allowing a tight queue of cars to form at each portal without overlap
+// Input: commands: Commands for spawning car entities; car_assets: Res<CarAssets> for the shared scene handle; queue: ResMut<CarSpawnQueue> holding pending spawns; pre_road_q: Query<&Transform> over all pre-road cars to check for occupancy at the spawn point
 // Returns: none
 pub fn car_spawn_queue_system(
     mut commands: Commands,
@@ -475,76 +472,64 @@ pub fn car_spawn_queue_system(
     mut queue: ResMut<CarSpawnQueue>,
     pre_road_q: Query<&Transform, With<PreRoad>>,
 ) {
-    for sub_queue in queue.queues.values_mut() {
-        let Some(queued) = sub_queue.front() else {
-            continue;
-        };
-        let spawn_pos = queued.spawn_xz;
-        let blocked = pre_road_q.iter().any(|t| {
-            let dx = t.translation.x - spawn_pos.x;
-            let dz = t.translation.z - spawn_pos.y;
-            dx * dx + dz * dz < SPAWN_CLEAR_RADIUS * SPAWN_CLEAR_RADIUS
-        });
-        if blocked {
-            continue;
-        }
-        let queued = sub_queue.pop_front().unwrap();
-        let spawn_pos = queued.spawn_xz;
-        let http_state = Arc::new(Mutex::new(CarHttp::new(spawn_pos.x, spawn_pos.y)));
-        spawn_car_listener(queued.port, Arc::clone(&http_state));
-        let model_scene = if queued.is_ambulance {
-            car_assets.ambulance_scene.clone()
-        } else {
-            car_assets.scene.clone()
-        };
-        commands
-            .spawn((
-                Transform::from_xyz(spawn_pos.x, 13.5, spawn_pos.y),
-                Visibility::Inherited,
-                crate::CarColor(queued.car_color),
-                CarLicense(queued.license.clone()),
-                PreRoad {
-                    phase: PreRoadPhase::DrivingToWait,
-                    wait_target: Vec3::new(queued.wait_xz_offset.x, 13.5, queued.wait_xz_offset.y),
-                    road_entry: Vec3::new(queued.road_entry_xz.x, 13.5, queued.road_entry_xz.y),
-                    license: queued.license.clone(),
-                    car_url: queued.car_url,
-                    register_url: queued.register_url,
-                    validate_url: queued.validate_url,
-                    src_node_id: queued.src_node_id,
-                    dst_node_id: queued.dst_node_id,
-                    polling_in_flight: false,
-                },
-                PostRoad {
-                    center: Vec3::new(queued.dst_center[0], 13.5, queued.dst_center[1]),
-                },
-                CarPhysics {
-                    http: http_state,
-                    speed: 0.0,
-                    dir_x: 1.0,
-                    dir_z: 0.0,
-                },
-            ))
-            .with_children(|parent| {
-                let scale = if queued.is_ambulance {
-                    AMBULANCE_SCALE
-                } else {
-                    crate::CAR_SCALE
-                };
-                parent.spawn((
-                    SceneRoot(model_scene),
-                    Transform::from_xyz(0.0, 0.0, 0.0).with_scale(Vec3::splat(scale)),
-                ));
-                parent.spawn((
-                    Transform::IDENTITY,
-                    bevy::picking::prelude::Pickable::IGNORE,
-                ));
-            });
-        println!(
-            "Queue released {} (ambulance: {})",
-            queued.license, queued.is_ambulance
-        );
+    if queue.queue.is_empty() {
+        return;
     }
+    let Some(queued) = queue.queue.front() else {
+        return;
+    };
+    let spawn_pos = queued.spawn_xz;
+    let blocked = pre_road_q.iter().any(|t| {
+        let dx = t.translation.x - spawn_pos.x;
+        let dz = t.translation.z - spawn_pos.y;
+        dx * dx + dz * dz < SPAWN_CLEAR_RADIUS * SPAWN_CLEAR_RADIUS
+    });
+    if blocked {
+        return;
+    }
+    let queued = queue.queue.pop_front().unwrap();
+    let spawn_pos = queued.spawn_xz;
+    let http_state = Arc::new(Mutex::new(CarHttp::new(spawn_pos.x, spawn_pos.y)));
+    spawn_car_listener(queued.port, Arc::clone(&http_state));
+    commands
+        .spawn((
+            Transform::from_xyz(spawn_pos.x, 13.5, spawn_pos.y),
+            Visibility::Inherited,
+            crate::CarColor(queued.car_color),
+            CarLicense(queued.license.clone()),
+            PreRoad {
+                phase: PreRoadPhase::DrivingToWait,
+                wait_target: Vec3::new(queued.wait_xz_offset.x, 13.5, queued.wait_xz_offset.y),
+                road_entry: Vec3::new(queued.road_entry_xz.x, 13.5, queued.road_entry_xz.y),
+                license: queued.license.clone(),
+                car_url: queued.car_url,
+                register_url: queued.register_url,
+                validate_url: queued.validate_url,
+                src_node_id: queued.src_node_id,
+                dst_node_id: queued.dst_node_id,
+                polling_in_flight: false,
+            },
+            PostRoad {
+                center: Vec3::new(queued.dst_center[0], 13.5, queued.dst_center[1]),
+            },
+            CarPhysics {
+                http: http_state,
+                speed: 0.0,
+                dir_x: 1.0,
+                dir_z: 0.0,
+            },
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                SceneRoot(car_assets.scene.clone()),
+                Transform::from_xyz(0.0, 0.0, 0.0).with_scale(Vec3::splat(crate::CAR_SCALE)),
+            ));
+            parent.spawn((
+                Transform::IDENTITY,
+                bevy::picking::prelude::Pickable::IGNORE,
+            ));
+        });
+    println!("Queue released {}", queued.license);
 }
 
 // Drives the pre-road state machine for all cars not yet on the roadway, handling both driving to the wait position and polling the server for entry approval, and removing the PreRoad component once entry is granted; rotates the car model to face its current movement direction during DrivingToWait using the same angle formula as update_car_rotation

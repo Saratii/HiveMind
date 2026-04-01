@@ -13,6 +13,7 @@ Citation: Used AI copilot for limited code generation - claude.ai
 
 use bevy::prelude::*;
 use std::{
+    collections::{HashMap, VecDeque},
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     sync::{Arc, Mutex},
@@ -22,7 +23,7 @@ use std::{
 use ureq::post;
 
 use crate::{
-    ACCELERATION, EXIT_DRIVE_SPEED, ROAD_WIDTH,
+    ACCELERATION, AMBULANCE_SCALE, EXIT_DRIVE_SPEED, ROAD_WIDTH,
     map_parser::{CityData, Waypoint, parse_waypoints},
     parse_form,
 };
@@ -254,7 +255,6 @@ pub fn update_car_physics(
                 if post_road.is_some() {
                     commands.entity(car_entity).insert(ParkingIn);
                 } else {
-                    println!("{}: reached destination, despawning", car_license.0);
                     commands.entity(car_entity).despawn();
                     for (seg_entity, seg_license) in path_segs.iter() {
                         if seg_license.0 == car_license.0 {
@@ -300,10 +300,7 @@ pub fn update_car_physics(
             let wp = &h.waypoints[wp_index];
             (wp.x, wp.z)
         };
-        let to_wp = Vec2::new(
-            wp_x - transform.translation.x,
-            wp_z - transform.translation.z,
-        );
+        let to_wp = Vec2::new(wp_x - self_x, wp_z - self_z);
         let dist_to_wp = to_wp.length();
         if dist_to_wp > 1.0 {
             physics.dir_x = to_wp.x / dist_to_wp;
@@ -352,7 +349,6 @@ pub fn parking_in_system(
         );
         let dist = diff.length();
         if dist < PARK_PROXIMITY {
-            println!("{}: parked, despawning", car_license.0);
             commands.entity(car_entity).despawn();
             for (seg_entity, seg_license) in path_segs.iter() {
                 if seg_license.0 == car_license.0 {
@@ -438,7 +434,6 @@ fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<CarHttp>>) {
     } else {
         String::new()
     };
-
     let response = match (method.as_str(), path.split('?').next().unwrap_or("")) {
         ("GET", "/position") => {
             let s = state.lock().unwrap();
@@ -652,16 +647,6 @@ pub fn pre_road_system(
                                 .get("speed")
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(40.0);
-                            println!(
-                                "{}: received {} waypoints: {}",
-                                pre.license,
-                                waypoints.len(),
-                                waypoints
-                                    .iter()
-                                    .map(|wp| wp.node_id.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(" -> ")
-                            );
                             let waypoints = offset_waypoints_to_right_lane(waypoints);
                             let mut h = physics.http.lock().unwrap();
                             h.waypoints = waypoints;

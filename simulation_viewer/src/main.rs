@@ -4,8 +4,8 @@ Name of program: main.rs
 Description: Main file for the rendering. Sets up a bevy app with various game display elements.
 Author: Maren Proplesch
 Date Created: 3/13/2026
-Date Revised: 3/29/2026
-Revision History: Spawn calls routed through CarSpawnQueue for gap-based spacing.
+Date Revised: 3/31/2026
+Revision History: Spawn calls routed through CarSpawnQueue for gap-based spacing. Added day-night cycle and ambulance spawns. Added shadow toggle button and improved shadow cascade settings.
 Preconditions: Not applicable/Redundant
 Postconditions: Not applicable/Redundant
 Citation: Used AI copilot for limited code generation - claude.ai
@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::f32::consts::PI;
 
 use crate::{
-    buildings::spawn_buildings,
+    buildings::{BuildingMarker, spawn_buildings},
     cameras::{CameraMode, FlyCamState, OrbitMomentum, flycam_system, orbit_camera, zoom_camera},
     car_emulator::{
         CarLicense, CarPhysics, CarSpawnQueue, ParkingIn, PreRoad, QueuedCar, car_facing_quat,
@@ -53,6 +53,10 @@ const BATCH_SPAWN_COUNT: usize = 20;
 const CAR_SCALE: f32 = 3.5;
 const AMBULANCE_SCALE: f32 = 3.0;
 const ROAD_WIDTH: f32 = 24.0;
+
+// Marker component attached to the UI button that shows and hides all building meshes
+#[derive(Component)]
+struct ToggleBuildingsButton;
 
 // Tracks which portal the user has clicked first when selecting a source-destination pair for spawning a car
 // first: the index into the city portals list of the first selected portal, or None if no portal is currently selected
@@ -97,6 +101,7 @@ struct PortalMaterials {
 #[derive(Resource)]
 pub struct CarAssets {
     pub scene: Handle<Scene>,
+    pub ambulance_scene: Handle<Scene>,
     pub skybox: Handle<Image>,
 }
 
@@ -295,7 +300,10 @@ fn right_lane_offset(dir: Vec2) -> Vec2 {
     right * (ROAD_WIDTH * 0.25)
 }
 
-// Builds a QueuedCar from portal indices and pushes it onto the CarSpawnQueue; shared by both the single-click portal handler and the batch spawn button so spawn logic is not duplicated
+// Builds a QueuedCar from portal indices and pushes it onto the correct per-portal sub-queue in
+// CarSpawnQueue; the sub-queue is keyed by src_idx so cars from different portals never delay each
+// other; assigns a 1-in-10 chance of spawning an ambulance using a fast LCG seeded from system
+// nanoseconds and the current car ID
 // Input: src_idx: usize index of the source portal; dst_idx: usize index of the destination portal; city: &CityData; selection: &mut PortalSelection for car ID and port counters; queue: &mut CarSpawnQueue
 // Returns: none
 fn enqueue_car(
@@ -334,24 +342,39 @@ fn enqueue_car(
     let register_url = format!("{}{}", SERVER_URL, REGISTER_CAR_ENDPOINT);
     let validate_url = format!("{}{}", SERVER_URL, VALIDATE_ENTRY_ENDPOINT);
     let car_color = rand_car_color();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0xbada55_u64);
+    let mut ambo_seed = nanos ^ (i as u64).wrapping_mul(0x9e3779b97f4a7c15);
+    ambo_seed = ambo_seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let is_ambulance = (ambo_seed >> 33) % 10 == 0;
     println!(
-        "Queuing {} port {} : portal {} -> portal {}",
-        license, port, src_idx, dst_idx
+        "Queuing {} port {} : portal {} -> portal {} (ambulance: {})",
+        license, port, src_idx, dst_idx, is_ambulance
     );
-    queue.queue.push_back(QueuedCar {
-        spawn_xz,
-        wait_xz_offset,
-        road_entry_xz,
-        license,
-        car_url,
-        register_url,
-        validate_url,
-        src_node_id: src.node.id.clone(),
-        dst_node_id: city.portals[dst_idx].node.id.clone(),
-        dst_center: city.portals[dst_idx].center,
-        car_color,
-        port,
-    });
+    queue
+        .queues
+        .entry(src_idx)
+        .or_default()
+        .push_back(QueuedCar {
+            portal_index: src_idx,
+            spawn_xz,
+            wait_xz_offset,
+            road_entry_xz,
+            license,
+            car_url,
+            register_url,
+            validate_url,
+            src_node_id: src.node.id.clone(),
+            dst_node_id: city.portals[dst_idx].node.id.clone(),
+            dst_center: city.portals[dst_idx].center,
+            car_color,
+            port,
+            is_ambulance,
+        });
 }
 
 // Handles primary click events on portal entities, managing a two-click selection flow where the first click highlights the source portal and the second click enqueues a car routed between the two selected portals
@@ -446,6 +469,7 @@ fn main() {
         .insert_resource(FlyCamState::default())
         .insert_resource(PortalSelection::new())
         .insert_resource(CarSpawnQueue::default())
+        .insert_resource(DayNightCycle::default())
         .insert_non_send_resource(city)
         .add_systems(Startup, (setup, spawn_buildings))
         .add_systems(
@@ -459,6 +483,7 @@ fn main() {
                 car_spawn_queue_system,
                 pre_road_system,
                 update_car_physics,
+                toggle_buildings_system,
             ),
         )
         .add_systems(
@@ -779,6 +804,40 @@ fn setup(
         },
         AmbientLightMarker,
     ));
+    commands
+        .spawn((
+            UiNode {
+                position_type: PositionType::Absolute,
+                bottom: Val::Px(20.0),
+                left: Val::Px(740.0),
+                width: Val::Px(160.0),
+                height: Val::Px(48.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
+            Button,
+            ToggleBuildingsButton,
+            BorderColor {
+                top: Color::srgb(0.6, 0.6, 0.7),
+                right: Color::srgb(0.6, 0.6, 0.7),
+                bottom: Color::srgb(0.6, 0.6, 0.7),
+                left: Color::srgb(0.6, 0.6, 0.7),
+            },
+            BackgroundColor(Color::srgba(0.1, 0.1, 0.15, 0.85)),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new("Buildings: On"),
+                TextFont {
+                    font_size: 20.0,
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+                ToggleBuildingsButton,
+            ));
+        });
     // Shadows enabled with bias values raised above defaults to suppress self-shadowing acne on
     // large flat road surfaces; maximum_distance is set to 8000 to cover the full city from the
     // default orbit radius of 3200, avoiding the hard cutoff line that appeared when it was 3000;
@@ -1162,6 +1221,8 @@ fn despawn_passed_segments(
 ) {
     if segments.is_empty() {
         return;
+    }if cars.is_empty() {
+        return;
     }
     let wp_map: HashMap<&str, usize> = cars
         .iter()
@@ -1229,6 +1290,43 @@ fn toggle_flycam_system(
     }
 }
 
+// Responds to presses of the node label toggle button by flipping Visibility on all NodeLabel
+// entities between Inherited and Hidden, and updating the button label to reflect the new state
+// Input: interaction_q: Query detecting button presses on ToggleLabelsButton; button_label_q: Query
+// over Text entities with ToggleLabelsButton to update the button text; node_labels: Query over all
+// NodeLabel entities to mutate their Visibility
+// Returns: none
+fn toggle_labels_system(
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<ToggleLabelsButton>)>,
+    mut button_label_q: Query<&mut Text, With<ToggleLabelsButton>>,
+    mut node_labels: Query<&mut Visibility, With<NodeLabel>>,
+) {
+    let clicked = interaction_q.iter().any(|i| *i == Interaction::Pressed);
+    if !clicked {
+        return;
+    }
+    let currently_visible = node_labels
+        .iter()
+        .next()
+        .map(|v| *v != Visibility::Hidden)
+        .unwrap_or(true);
+    let next_visibility = if currently_visible {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    };
+    for mut vis in node_labels.iter_mut() {
+        *vis = next_visibility;
+    }
+    for mut text in button_label_q.iter_mut() {
+        text.0 = if currently_visible {
+            "Labels: Off".to_string()
+        } else {
+            "Labels: On".to_string()
+        };
+    }
+}
+
 // Responds to presses of the batch spawn button by picking up to BATCH_SPAWN_COUNT random unique portal pairs, skipping any routes already in use, and enqueuing a car for each valid pair
 // Input: interaction_q: Query for detecting button press interactions; city: NonSend<CityData> for portal data; selection: ResMut<PortalSelection> for car ID and port counters; queue: ResMut<CarSpawnQueue> for enqueuing new cars; existing_cars: Query<&PreRoad> to avoid duplicate routes
 // Returns: none
@@ -1252,8 +1350,10 @@ fn spawn_batch_button_system(
         .iter()
         .map(|p| (p.src_node_id.clone(), p.dst_node_id.clone()))
         .collect();
-    for qc in queue.queue.iter() {
-        used.insert((qc.src_node_id.clone(), qc.dst_node_id.clone()));
+    for sub_queue in queue.queues.values() {
+        for qc in sub_queue.iter() {
+            used.insert((qc.src_node_id.clone(), qc.dst_node_id.clone()));
+        }
     }
     let mut rng_seed: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1290,4 +1390,41 @@ fn spawn_batch_button_system(
         "Batch spawn: {} cars queued ({} attempts)",
         spawned, attempts
     );
+}
+
+// Responds to presses of the building toggle button by flipping Visibility on all BuildingMarker
+// entities between Inherited and Hidden, and updating the button label to reflect the new state
+// Input: interaction_q: Query detecting button presses on ToggleBuildingsButton; button_label_q: Query
+// over Text entities with ToggleBuildingsButton to update the button text; buildings: Query over all
+// BuildingMarker entities to mutate their Visibility
+// Returns: none
+fn toggle_buildings_system(
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<ToggleBuildingsButton>)>,
+    mut button_label_q: Query<&mut Text, With<ToggleBuildingsButton>>,
+    mut buildings: Query<&mut Visibility, With<BuildingMarker>>,
+) {
+    let clicked = interaction_q.iter().any(|i| *i == Interaction::Pressed);
+    if !clicked {
+        return;
+    }
+    let currently_visible = buildings
+        .iter()
+        .next()
+        .map(|v| *v != Visibility::Hidden)
+        .unwrap_or(true);
+    let next_visibility = if currently_visible {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    };
+    for mut vis in buildings.iter_mut() {
+        *vis = next_visibility;
+    }
+    for mut text in button_label_q.iter_mut() {
+        text.0 = if currently_visible {
+            "Buildings: Off".to_string()
+        } else {
+            "Buildings: On".to_string()
+        };
+    }
 }

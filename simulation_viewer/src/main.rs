@@ -6,6 +6,8 @@ Author: Maren Proplesch
 Date Created: 3/13/2026
 Date Revised: 3/31/2026
 Revision History: Spawn calls routed through CarSpawnQueue for gap-based spacing. Added day-night cycle and ambulance spawns. Added shadow toggle button and improved shadow cascade settings.
+Date Revised: 3/31/2026
+Revision History: Spawn calls routed through CarSpawnQueue for gap-based spacing. Added day-night cycle and ambulance spawns. Added shadow toggle button and improved shadow cascade settings.
 Preconditions: Not applicable/Redundant
 Postconditions: Not applicable/Redundant
 Citation: Used AI copilot for limited code generation - claude.ai
@@ -101,6 +103,7 @@ struct PortalMaterials {
 #[derive(Resource)]
 pub struct CarAssets {
     pub scene: Handle<Scene>,
+    pub ambulance_scene: Handle<Scene>,
     pub ambulance_scene: Handle<Scene>,
     pub skybox: Handle<Image>,
 }
@@ -304,6 +307,10 @@ fn right_lane_offset(dir: Vec2) -> Vec2 {
 // CarSpawnQueue; the sub-queue is keyed by src_idx so cars from different portals never delay each
 // other; assigns a 1-in-10 chance of spawning an ambulance using a fast LCG seeded from system
 // nanoseconds and the current car ID
+// Builds a QueuedCar from portal indices and pushes it onto the correct per-portal sub-queue in
+// CarSpawnQueue; the sub-queue is keyed by src_idx so cars from different portals never delay each
+// other; assigns a 1-in-10 chance of spawning an ambulance using a fast LCG seeded from system
+// nanoseconds and the current car ID
 // Input: src_idx: usize index of the source portal; dst_idx: usize index of the destination portal; city: &CityData; selection: &mut PortalSelection for car ID and port counters; queue: &mut CarSpawnQueue
 // Returns: none
 fn enqueue_car(
@@ -476,6 +483,7 @@ fn main() {
         .insert_resource(FlyCamState::default())
         .insert_resource(PortalSelection::new())
         .insert_resource(CarSpawnQueue::default())
+        .insert_resource(DayNightCycle::default())
         .insert_resource(DayNightCycle::default())
         .insert_non_send_resource(city)
         .add_systems(Startup, (setup, spawn_buildings))

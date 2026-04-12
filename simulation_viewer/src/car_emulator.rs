@@ -38,6 +38,7 @@ const FOLLOW_MIN_FRACTION: f32 = 0.15;
 // is_priority: when true the car was spawned via portal click and receives a golden point light
 pub struct QueuedCar {
     pub portal_index: usize,
+    pub portal_index: usize,
     pub spawn_xz: Vec2,
     pub wait_xz_offset: Vec2,
     pub road_entry_xz: Vec2,
@@ -56,8 +57,11 @@ pub struct QueuedCar {
 
 // Shared resource holding one independent VecDeque per source portal so cars queued at different
 // portals never block each other; the key is the portal index into CityData::portals
+// Shared resource holding one independent VecDeque per source portal so cars queued at different
+// portals never block each other; the key is the portal index into CityData::portals
 #[derive(Resource, Default)]
 pub struct CarSpawnQueue {
+    pub queues: HashMap<usize, VecDeque<QueuedCar>>,
     pub queues: HashMap<usize, VecDeque<QueuedCar>>,
 }
 
@@ -136,6 +140,7 @@ pub struct PriorityCar;
 // right lane when viewed from above with +X pointing right and +Z pointing toward the viewer
 // Input: waypoints: Vec<Waypoint> centerline waypoints parsed from the server response
 // Returns: Vec<Waypoint> with x and z fields shifted by ROAD_WIDTH * 0.25 into the right lane
+// Returns: Vec<Waypoint> with x and z fields shifted by ROAD_WIDTH * 0.25 into the right lane
 fn offset_waypoints_to_right_lane(waypoints: Vec<Waypoint>) -> Vec<Waypoint> {
     let n = waypoints.len();
     if n < 2 {
@@ -149,6 +154,7 @@ fn offset_waypoints_to_right_lane(waypoints: Vec<Waypoint>) -> Vec<Waypoint> {
             if mag < 1e-6 {
                 return Vec2::ZERO;
             }
+            Vec2::new(-dz / mag, dx / mag)
             Vec2::new(-dz / mag, dx / mag)
         })
         .collect();
@@ -173,6 +179,12 @@ fn offset_waypoints_to_right_lane(waypoints: Vec<Waypoint>) -> Vec<Waypoint> {
     result
 }
 
+// Computes a following-adjusted speed by scanning the pre-built slice of other car positions and
+// directions, skipping oncoming traffic (dot product below 0.5) and cars that are behind, then
+// blending between closest_speed and target_speed proportionally to the gap fraction so cars
+// smoothly decelerate as they close in rather than snapping to a fixed speed
+// Input: pos_x, pos_z: f32 current position; dir_x, dir_z: f32 normalized movement direction; target_speed: f32 server-assigned speed; others: &[(f32, f32, f32, f32)] positions and directions of all other active cars
+// Returns: f32 the gap-blended speed, clamped to at least FOLLOW_MIN_FRACTION of target_speed
 // Computes a following-adjusted speed by scanning the pre-built slice of other car positions and
 // directions, skipping oncoming traffic (dot product below 0.5) and cars that are behind, then
 // blending between closest_speed and target_speed proportionally to the gap fraction so cars
@@ -214,6 +226,11 @@ fn following_speed(
     blended.max(target_speed * FOLLOW_MIN_FRACTION)
 }
 
+// Advances the physics simulation for all active roadway cars each frame; reads target speed,
+// stopped flag, wp_index, and wp_count from CarHttp in a single lock acquisition per car to
+// minimize mutex contention, then writes pos_x/pos_z back in a second acquisition only after
+// position is updated; applies car-following speed adjustment against a snapshot of all car
+// positions built once before the per-car loop to avoid re-querying the query inside the loop
 // Advances the physics simulation for all active roadway cars each frame; reads target speed,
 // stopped flag, wp_index, and wp_count from CarHttp in a single lock acquisition per car to
 // minimize mutex contention, then writes pos_x/pos_z back in a second acquisition only after
@@ -266,6 +283,7 @@ pub fn update_car_physics(
                 if post_road.is_some() {
                     commands.entity(car_entity).insert(ParkingIn);
                 } else {
+                    println!("{}: reached destination, despawning", car_license.0);
                     commands.entity(car_entity).despawn();
                     for (seg_entity, seg_license) in path_segs.iter() {
                         if seg_license.0 == car_license.0 {
@@ -278,16 +296,22 @@ pub fn update_car_physics(
         }
         let self_x = transform.translation.x;
         let self_z = transform.translation.z;
+        let self_x = transform.translation.x;
+        let self_z = transform.translation.z;
         let others_excluding_self: Vec<(f32, f32, f32, f32)> = others
             .iter()
             .copied()
             .filter(|&o| {
                 let dx = o.0 - self_x;
                 let dz = o.1 - self_z;
+                let dx = o.0 - self_x;
+                let dz = o.1 - self_z;
                 dx * dx + dz * dz > 1.0
             })
             .collect();
         let adjusted_speed = following_speed(
+            self_x,
+            self_z,
             self_x,
             self_z,
             physics.dir_x,
@@ -356,6 +380,7 @@ pub fn parking_in_system(
         );
         let dist = diff.length();
         if dist < PARK_PROXIMITY {
+            println!("{}: parked, despawning", car_license.0);
             commands.entity(car_entity).despawn();
             for (seg_entity, seg_license) in path_segs.iter() {
                 if seg_license.0 == car_license.0 {
@@ -470,6 +495,11 @@ pub fn spawn_car_listener(port: u16, state: Arc<Mutex<CarHttp>>) {
     });
 }
 
+// Iterates every per-portal sub-queue independently each frame; for each portal checks whether any
+// existing pre-road car is within SPAWN_CLEAR_RADIUS of that portal's spawn point and skips it if
+// blocked, otherwise pops and spawns the front entry; portals with empty queues are skipped
+// immediately so the cost scales with the number of portals that actually have pending cars
+// Input: commands: Commands for spawning car entities; car_assets: Res<CarAssets> for the shared scene handles; queue: ResMut<CarSpawnQueue> holding per-portal pending spawns; pre_road_q: Query<&Transform> over all pre-road cars to check for occupancy at each spawn point
 // Iterates every per-portal sub-queue independently each frame; for each portal checks whether any
 // existing pre-road car is within SPAWN_CLEAR_RADIUS of that portal's spawn point and skips it if
 // blocked, otherwise pops and spawns the front entry; portals with empty queues are skipped
@@ -693,6 +723,16 @@ pub fn pre_road_system(
                                 .get("speed")
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(40.0);
+                            println!(
+                                "{}: received {} waypoints: {}",
+                                pre.license,
+                                waypoints.len(),
+                                waypoints
+                                    .iter()
+                                    .map(|wp| wp.node_id.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" -> ")
+                            );
                             let waypoints = offset_waypoints_to_right_lane(waypoints);
                             let mut h = physics.http.lock().unwrap();
                             h.waypoints = waypoints;

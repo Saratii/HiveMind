@@ -104,6 +104,10 @@ const STEPPED_SPIRE_H_MAX: f32 = 24.0;
 const STEPPED_SPIRE_R_FRACTION: f32 = 0.22;
 const STEPPED_SPIRE_R_MIN: f32 = 1.5;
 
+// Marker component attached to every building mesh entity so the toggle system can query them
+#[derive(Component)]
+pub struct BuildingMarker;
+
 // Advances an LCG state and returns the next pseudorandom value
 // Input: state: &mut u64 the current LCG state, mutated in place
 // Returns: u64 the next value after the shift extraction
@@ -259,12 +263,14 @@ fn spawn_building(
                 MeshMaterial3d(mat.clone()),
                 Transform::from_xyz(cx, plinth_h * 0.5, cz),
                 Pickable::IGNORE,
+                BuildingMarker,
             ));
             commands.spawn((
                 Mesh3d(meshes.add(Cuboid::new(w, h, d))),
                 MeshMaterial3d(mat.clone()),
                 Transform::from_xyz(cx, plinth_h + h * 0.5, cz),
                 Pickable::IGNORE,
+                BuildingMarker,
             ));
             let win_h = h * TOWER_WIN_H_FRACTION;
             let win_y = plinth_h + h * TOWER_WIN_BOTTOM_FRACTION + win_h * 0.5;
@@ -277,6 +283,7 @@ fn spawn_building(
                 MeshMaterial3d(glass_mat.clone()),
                 Transform::from_xyz(cx, win_y, cz + d * 0.5 + TOWER_GLASS_OFFSET),
                 Pickable::IGNORE,
+                BuildingMarker,
             ));
             commands.spawn((
                 Mesh3d(meshes.add(Cuboid::new(
@@ -287,6 +294,7 @@ fn spawn_building(
                 MeshMaterial3d(glass_mat.clone()),
                 Transform::from_xyz(cx, win_y, cz - d * 0.5 - TOWER_GLASS_OFFSET),
                 Pickable::IGNORE,
+                BuildingMarker,
             ));
             commands.spawn((
                 Mesh3d(meshes.add(Cuboid::new(
@@ -297,6 +305,7 @@ fn spawn_building(
                 MeshMaterial3d(glass_mat.clone()),
                 Transform::from_xyz(cx + w * 0.5 + TOWER_GLASS_OFFSET, win_y, cz),
                 Pickable::IGNORE,
+                BuildingMarker,
             ));
             let crown_h = lcg_range(lcg(rng), TOWER_CROWN_H_MIN, TOWER_CROWN_H_MAX);
             commands.spawn((
@@ -308,6 +317,7 @@ fn spawn_building(
                 MeshMaterial3d(accent_mat.clone()),
                 Transform::from_xyz(cx, plinth_h + h + crown_h * 0.5, cz),
                 Pickable::IGNORE,
+                BuildingMarker,
             ));
         }
         // wide commercial block: squat body with decorative parapet ridges along all four edges
@@ -325,12 +335,14 @@ fn spawn_building(
                 MeshMaterial3d(mat.clone()),
                 Transform::from_xyz(cx, plinth_h * 0.5, cz),
                 Pickable::IGNORE,
+                BuildingMarker,
             ));
             commands.spawn((
                 Mesh3d(meshes.add(Cuboid::new(w, h, d))),
                 MeshMaterial3d(mat.clone()),
                 Transform::from_xyz(cx, plinth_h + h * 0.5, cz),
                 Pickable::IGNORE,
+                BuildingMarker,
             ));
             let ridge_h = BLOCK_RIDGE_H;
             let ridge_w = BLOCK_RIDGE_W;
@@ -340,24 +352,28 @@ fn spawn_building(
                 MeshMaterial3d(accent_mat.clone()),
                 Transform::from_xyz(cx + w * 0.5 - ridge_w * 0.5, top_y, cz),
                 Pickable::IGNORE,
+                BuildingMarker,
             ));
             commands.spawn((
                 Mesh3d(meshes.add(Cuboid::new(ridge_w, ridge_h, d + ridge_w * 2.0))),
                 MeshMaterial3d(accent_mat.clone()),
                 Transform::from_xyz(cx - w * 0.5 + ridge_w * 0.5, top_y, cz),
                 Pickable::IGNORE,
+                BuildingMarker,
             ));
             commands.spawn((
                 Mesh3d(meshes.add(Cuboid::new(w, ridge_h, ridge_w))),
                 MeshMaterial3d(accent_mat.clone()),
                 Transform::from_xyz(cx, top_y, cz + d * 0.5 - ridge_w * 0.5),
                 Pickable::IGNORE,
+                BuildingMarker,
             ));
             commands.spawn((
                 Mesh3d(meshes.add(Cuboid::new(w, ridge_h, ridge_w))),
                 MeshMaterial3d(accent_mat.clone()),
                 Transform::from_xyz(cx, top_y, cz - d * 0.5 + ridge_w * 0.5),
                 Pickable::IGNORE,
+                BuildingMarker,
             ));
             let rooftop_h = lcg_range(lcg(rng), BLOCK_ROOFTOP_H_MIN, BLOCK_ROOFTOP_H_MAX);
             commands.spawn((
@@ -369,6 +385,7 @@ fn spawn_building(
                 MeshMaterial3d(mat.clone()),
                 Transform::from_xyz(cx, plinth_h + h + rooftop_h * 0.5, cz),
                 Pickable::IGNORE,
+                BuildingMarker,
             ));
         }
         // setback stepped tower: 2-4 shrinking tiers with accent ledges and a cylinder spire on top
@@ -387,6 +404,7 @@ fn spawn_building(
                 MeshMaterial3d(mat.clone()),
                 Transform::from_xyz(cx, plinth_h * 0.5, cz),
                 Pickable::IGNORE,
+                BuildingMarker,
             ));
             let mut cur_y = plinth_h;
             let mut cur_w = base_w;
@@ -397,6 +415,7 @@ fn spawn_building(
                     MeshMaterial3d(mat.clone()),
                     Transform::from_xyz(cx, cur_y + tier_h * 0.5, cz),
                     Pickable::IGNORE,
+                    BuildingMarker,
                 ));
                 if tier < tiers - 1 {
                     commands.spawn((
@@ -408,6 +427,7 @@ fn spawn_building(
                         MeshMaterial3d(accent_mat.clone()),
                         Transform::from_xyz(cx, cur_y + tier_h + STEPPED_LEDGE_H * 0.5, cz),
                         Pickable::IGNORE,
+                        BuildingMarker,
                     ));
                     cur_y += tier_h + STEPPED_LEDGE_H;
                 } else {
@@ -423,6 +443,7 @@ fn spawn_building(
                 MeshMaterial3d(accent_mat.clone()),
                 Transform::from_xyz(cx, cur_y + spire_h * 0.5, cz),
                 Pickable::IGNORE,
+                BuildingMarker,
             ));
         }
     }

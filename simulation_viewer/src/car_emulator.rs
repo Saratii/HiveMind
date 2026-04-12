@@ -35,6 +35,7 @@ const FOLLOW_MIN_FRACTION: f32 = 0.15;
 // Holds the complete set of arguments needed to spawn a single car entity, queued when the user requests a spawn and released one at a time with spacing
 // portal_index: index of the source portal this car belongs to, used to route it into the correct per-portal sub-queue
 // is_ambulance: when true the car uses ambulance.glb instead of the default model, assigned with a 1-in-10 probability at enqueue time
+// is_priority: when true the car was spawned via portal click and receives a golden point light
 pub struct QueuedCar {
     pub portal_index: usize,
     pub spawn_xz: Vec2,
@@ -50,6 +51,7 @@ pub struct QueuedCar {
     pub car_color: Color,
     pub port: u16,
     pub is_ambulance: bool,
+    pub is_priority: bool,
 }
 
 // Shared resource holding one independent VecDeque per source portal so cars queued at different
@@ -121,6 +123,11 @@ pub struct CarLicense(pub String);
 
 #[derive(Component)]
 pub struct ParkingIn;
+
+// Marker component attached to cars spawned via portal click rather than batch spawn,
+// used to identify priority cars that carry a golden point light
+#[derive(Component)]
+pub struct PriorityCar;
 
 // Displaces waypoints into the right lane using per-segment perpendiculars averaged at corners; for
 // a forward direction (dx, dz) the right lane in Bevy's Y-up right-handed XZ plane is the
@@ -259,7 +266,6 @@ pub fn update_car_physics(
                 if post_road.is_some() {
                     commands.entity(car_entity).insert(ParkingIn);
                 } else {
-                    println!("{}: reached destination, despawning", car_license.0);
                     commands.entity(car_entity).despawn();
                     for (seg_entity, seg_license) in path_segs.iter() {
                         if seg_license.0 == car_license.0 {
@@ -350,7 +356,6 @@ pub fn parking_in_system(
         );
         let dist = diff.length();
         if dist < PARK_PROXIMITY {
-            println!("{}: parked, despawning", car_license.0);
             commands.entity(car_entity).despawn();
             for (seg_entity, seg_license) in path_segs.iter() {
                 if seg_license.0 == car_license.0 {
@@ -473,6 +478,8 @@ pub fn spawn_car_listener(port: u16, state: Arc<Mutex<CarHttp>>) {
 // Returns: none
 pub fn car_spawn_queue_system(
     mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     car_assets: Res<crate::CarAssets>,
     mut queue: ResMut<CarSpawnQueue>,
     pre_road_q: Query<&Transform, With<PreRoad>>,
@@ -499,53 +506,75 @@ pub fn car_spawn_queue_system(
         } else {
             car_assets.scene.clone()
         };
-        commands
-            .spawn((
-                Transform::from_xyz(spawn_pos.x, 13.5, spawn_pos.y),
-                Visibility::Inherited,
-                crate::CarColor(queued.car_color),
-                CarLicense(queued.license.clone()),
-                PreRoad {
-                    phase: PreRoadPhase::DrivingToWait,
-                    wait_target: Vec3::new(queued.wait_xz_offset.x, 13.5, queued.wait_xz_offset.y),
-                    road_entry: Vec3::new(queued.road_entry_xz.x, 13.5, queued.road_entry_xz.y),
-                    license: queued.license.clone(),
-                    car_url: queued.car_url,
-                    register_url: queued.register_url,
-                    validate_url: queued.validate_url,
-                    src_node_id: queued.src_node_id,
-                    dst_node_id: queued.dst_node_id,
-                    polling_in_flight: false,
-                },
-                PostRoad {
-                    center: Vec3::new(queued.dst_center[0], 13.5, queued.dst_center[1]),
-                },
-                CarPhysics {
-                    http: http_state,
-                    speed: 0.0,
-                    dir_x: 1.0,
-                    dir_z: 0.0,
-                },
-            ))
-            .with_children(|parent| {
-                let scale = if queued.is_ambulance {
-                    AMBULANCE_SCALE
-                } else {
-                    crate::CAR_SCALE
-                };
+        let is_priority = queued.is_priority;
+        let mut entity_cmd = commands.spawn((
+            Transform::from_xyz(spawn_pos.x, 13.5, spawn_pos.y),
+            Visibility::Inherited,
+            crate::CarColor(queued.car_color),
+            CarLicense(queued.license.clone()),
+            PreRoad {
+                phase: PreRoadPhase::DrivingToWait,
+                wait_target: Vec3::new(queued.wait_xz_offset.x, 13.5, queued.wait_xz_offset.y),
+                road_entry: Vec3::new(queued.road_entry_xz.x, 13.5, queued.road_entry_xz.y),
+                license: queued.license.clone(),
+                car_url: queued.car_url,
+                register_url: queued.register_url,
+                validate_url: queued.validate_url,
+                src_node_id: queued.src_node_id,
+                dst_node_id: queued.dst_node_id,
+                polling_in_flight: false,
+            },
+            PostRoad {
+                center: Vec3::new(queued.dst_center[0], 13.5, queued.dst_center[1]),
+            },
+            CarPhysics {
+                http: http_state,
+                speed: 0.0,
+                dir_x: 1.0,
+                dir_z: 0.0,
+            },
+        ));
+        if is_priority {
+            entity_cmd.insert(PriorityCar);
+        }
+        entity_cmd.with_children(|parent| {
+            let scale = if queued.is_ambulance {
+                AMBULANCE_SCALE
+            } else {
+                crate::CAR_SCALE
+            };
+            parent.spawn((
+                SceneRoot(model_scene),
+                Transform::from_xyz(0.0, 0.0, 0.0).with_scale(Vec3::splat(scale)),
+            ));
+            parent.spawn((
+                Transform::IDENTITY,
+                bevy::picking::prelude::Pickable::IGNORE,
+            ));
+            if is_priority {
                 parent.spawn((
-                    SceneRoot(model_scene),
-                    Transform::from_xyz(0.0, 0.0, 0.0).with_scale(Vec3::splat(scale)),
+                    PointLight {
+                        color: Color::srgb(1.0, 0.75, 0.0),
+                        intensity: 200_000.0,
+                        radius: 20.0,
+                        range: 120.0,
+                        shadows_enabled: false,
+                        ..default()
+                    },
+                    Transform::from_xyz(0.0, 20.0, 0.0),
                 ));
                 parent.spawn((
-                    Transform::IDENTITY,
-                    bevy::picking::prelude::Pickable::IGNORE,
+                    Mesh3d(meshes.add(Sphere::new(6.0))),
+                    MeshMaterial3d(materials.add(StandardMaterial {
+                        base_color: Color::srgb(1.0, 0.75, 0.0),
+                        emissive: LinearRgba::new(2.0, 1.5, 0.0, 1.0),
+                        unlit: true,
+                        ..default()
+                    })),
+                    Transform::from_xyz(0.0, 30.0, 0.0),
                 ));
-            });
-        println!(
-            "Queue released {} (ambulance: {})",
-            queued.license, queued.is_ambulance
-        );
+            }
+        });
     }
 }
 
@@ -592,7 +621,7 @@ pub fn pre_road_system(
                             .header("Content-Type", "application/x-www-form-urlencoded")
                             .send(&body)
                         {
-                            Ok(resp) => println!("registered {}: {}", license, resp.status()),
+                            Ok(_) => {}
                             Err(ureq::Error::StatusCode(c)) => {
                                 eprintln!("{} register failed: http {}", license, c)
                             }
@@ -664,16 +693,6 @@ pub fn pre_road_system(
                                 .get("speed")
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(40.0);
-                            println!(
-                                "{}: received {} waypoints: {}",
-                                pre.license,
-                                waypoints.len(),
-                                waypoints
-                                    .iter()
-                                    .map(|wp| wp.node_id.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(" -> ")
-                            );
                             let waypoints = offset_waypoints_to_right_lane(waypoints);
                             let mut h = physics.http.lock().unwrap();
                             h.waypoints = waypoints;

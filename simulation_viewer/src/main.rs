@@ -30,7 +30,7 @@ use bevy::{
 };
 use iyes_perf_ui::PerfUiPlugin;
 use iyes_perf_ui::prelude::PerfUiDefaultEntries;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::f32::consts::PI;
 
 use crate::{
@@ -312,6 +312,7 @@ fn enqueue_car(
     city: &CityData,
     selection: &mut PortalSelection,
     queue: &mut CarSpawnQueue,
+    is_priority: bool,
 ) {
     let src = &city.portals[src_idx];
     let [sx, sz] = src.center;
@@ -351,30 +352,29 @@ fn enqueue_car(
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
     let is_ambulance = (ambo_seed >> 33) % 10 == 0;
-    println!(
-        "Queuing {} port {} : portal {} -> portal {} (ambulance: {})",
-        license, port, src_idx, dst_idx, is_ambulance
-    );
-    queue
-        .queues
-        .entry(src_idx)
-        .or_default()
-        .push_back(QueuedCar {
-            portal_index: src_idx,
-            spawn_xz,
-            wait_xz_offset,
-            road_entry_xz,
-            license,
-            car_url,
-            register_url,
-            validate_url,
-            src_node_id: src.node.id.clone(),
-            dst_node_id: city.portals[dst_idx].node.id.clone(),
-            dst_center: city.portals[dst_idx].center,
-            car_color,
-            port,
-            is_ambulance,
-        });
+    let queued_car = QueuedCar {
+        portal_index: src_idx,
+        spawn_xz,
+        wait_xz_offset,
+        road_entry_xz,
+        license,
+        car_url,
+        register_url,
+        validate_url,
+        src_node_id: src.node.id.clone(),
+        dst_node_id: city.portals[dst_idx].node.id.clone(),
+        dst_center: city.portals[dst_idx].center,
+        car_color,
+        port,
+        is_ambulance,
+        is_priority,
+    };
+    let sub_queue = queue.queues.entry(src_idx).or_default();
+    if is_priority {
+        sub_queue.push_front(queued_car);
+    } else {
+        sub_queue.push_back(queued_car);
+    }
 }
 
 // Handles primary click events on portal entities, managing a two-click selection flow where the first click highlights the source portal and the second click enqueues a car routed between the two selected portals
@@ -422,13 +422,20 @@ fn on_portal_click(
                     && pre.dst_node_id == city.portals[clicked_idx].node.id
             });
             if route_taken {
-                println!(
-                    "Route {}->{} already in use, ignoring",
-                    src_idx, clicked_idx
-                );
+                // println!(
+                //     "Route {}->{} already in use, ignoring",
+                //     src_idx, clicked_idx
+                // );
                 return;
             }
-            enqueue_car(src_idx, clicked_idx, &city, &mut selection, &mut queue);
+            enqueue_car(
+                src_idx,
+                clicked_idx,
+                &city,
+                &mut selection,
+                &mut queue,
+                true,
+            );
         }
     }
 }
@@ -1221,7 +1228,8 @@ fn despawn_passed_segments(
 ) {
     if segments.is_empty() {
         return;
-    }if cars.is_empty() {
+    }
+    if cars.is_empty() {
         return;
     }
     let wp_map: HashMap<&str, usize> = cars
@@ -1327,7 +1335,7 @@ fn toggle_labels_system(
     }
 }
 
-// Responds to presses of the batch spawn button by picking up to BATCH_SPAWN_COUNT random unique portal pairs, skipping any routes already in use, and enqueuing a car for each valid pair
+// Responds to presses of the batch spawn button by picking up to BATCH_SPAWN_COUNT random unique portal pairs, and enqueuing a car for each valid pair
 // Input: interaction_q: Query for detecting button press interactions; city: NonSend<CityData> for portal data; selection: ResMut<PortalSelection> for car ID and port counters; queue: ResMut<CarSpawnQueue> for enqueuing new cars; existing_cars: Query<&PreRoad> to avoid duplicate routes
 // Returns: none
 fn spawn_batch_button_system(
@@ -1335,7 +1343,6 @@ fn spawn_batch_button_system(
     city: NonSend<CityData>,
     mut selection: ResMut<PortalSelection>,
     mut queue: ResMut<CarSpawnQueue>,
-    existing_cars: Query<&PreRoad>,
 ) {
     let clicked = interaction_q.iter().any(|i| *i == Interaction::Pressed);
     if !clicked {
@@ -1343,28 +1350,14 @@ fn spawn_batch_button_system(
     }
     let portals = &city.portals;
     if portals.len() < 2 {
-        eprintln!("Not enough portals to spawn batch");
         return;
-    }
-    let mut used: HashSet<(String, String)> = existing_cars
-        .iter()
-        .map(|p| (p.src_node_id.clone(), p.dst_node_id.clone()))
-        .collect();
-    for sub_queue in queue.queues.values() {
-        for qc in sub_queue.iter() {
-            used.insert((qc.src_node_id.clone(), qc.dst_node_id.clone()));
-        }
     }
     let mut rng_seed: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(0xbada55_c0ffee)
         ^ (selection.next_car_id as u64).wrapping_mul(2654435761);
-    let mut spawned = 0;
-    let mut attempts = 0;
-    let max_attempts = BATCH_SPAWN_COUNT * portals.len() * 2;
-    while spawned < BATCH_SPAWN_COUNT && attempts < max_attempts {
-        attempts += 1;
+    for _ in 0..BATCH_SPAWN_COUNT {
         rng_seed = rng_seed
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
@@ -1372,24 +1365,12 @@ fn spawn_batch_button_system(
         rng_seed = rng_seed
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let dst_idx = (rng_seed >> 33) as usize % portals.len();
-        if src_idx == dst_idx {
-            continue;
+        let mut dst_idx = (rng_seed >> 33) as usize % portals.len();
+        if dst_idx == src_idx {
+            dst_idx = (src_idx + 1) % portals.len();
         }
-        let src_id = portals[src_idx].node.id.clone();
-        let dst_id = portals[dst_idx].node.id.clone();
-        let route_key = (src_id.clone(), dst_id.clone());
-        if used.contains(&route_key) {
-            continue;
-        }
-        used.insert(route_key);
-        enqueue_car(src_idx, dst_idx, &city, &mut selection, &mut queue);
-        spawned += 1;
+        enqueue_car(src_idx, dst_idx, &city, &mut selection, &mut queue, false);
     }
-    println!(
-        "Batch spawn: {} cars queued ({} attempts)",
-        spawned, attempts
-    );
 }
 
 // Responds to presses of the building toggle button by flipping Visibility on all BuildingMarker

@@ -38,7 +38,6 @@ const FOLLOW_MIN_FRACTION: f32 = 0.15;
 // is_priority: when true the car was spawned via portal click and receives a golden point light
 pub struct QueuedCar {
     pub portal_index: usize,
-    pub portal_index: usize,
     pub spawn_xz: Vec2,
     pub wait_xz_offset: Vec2,
     pub road_entry_xz: Vec2,
@@ -61,7 +60,6 @@ pub struct QueuedCar {
 // portals never block each other; the key is the portal index into CityData::portals
 #[derive(Resource, Default)]
 pub struct CarSpawnQueue {
-    pub queues: HashMap<usize, VecDeque<QueuedCar>>,
     pub queues: HashMap<usize, VecDeque<QueuedCar>>,
 }
 
@@ -154,7 +152,6 @@ fn offset_waypoints_to_right_lane(waypoints: Vec<Waypoint>) -> Vec<Waypoint> {
             if mag < 1e-6 {
                 return Vec2::ZERO;
             }
-            Vec2::new(-dz / mag, dx / mag)
             Vec2::new(-dz / mag, dx / mag)
         })
         .collect();
@@ -296,28 +293,13 @@ pub fn update_car_physics(
         }
         let self_x = transform.translation.x;
         let self_z = transform.translation.z;
-        let self_x = transform.translation.x;
-        let self_z = transform.translation.z;
-        let others_excluding_self: Vec<(f32, f32, f32, f32)> = others
-            .iter()
-            .copied()
-            .filter(|&o| {
-                let dx = o.0 - self_x;
-                let dz = o.1 - self_z;
-                let dx = o.0 - self_x;
-                let dz = o.1 - self_z;
-                dx * dx + dz * dz > 1.0
-            })
-            .collect();
         let adjusted_speed = following_speed(
-            self_x,
-            self_z,
             self_x,
             self_z,
             physics.dir_x,
             physics.dir_z,
             target_speed,
-            &others_excluding_self,
+            &others,
         );
         let delta = adjusted_speed - physics.speed;
         physics.speed += delta.clamp(-ACCELERATION * dt, ACCELERATION * dt);
@@ -380,7 +362,6 @@ pub fn parking_in_system(
         );
         let dist = diff.length();
         if dist < PARK_PROXIMITY {
-            println!("{}: parked, despawning", car_license.0);
             commands.entity(car_entity).despawn();
             for (seg_entity, seg_license) in path_segs.iter() {
                 if seg_license.0 == car_license.0 {
@@ -723,16 +704,6 @@ pub fn pre_road_system(
                                 .get("speed")
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(40.0);
-                            println!(
-                                "{}: received {} waypoints: {}",
-                                pre.license,
-                                waypoints.len(),
-                                waypoints
-                                    .iter()
-                                    .map(|wp| wp.node_id.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(" -> ")
-                            );
                             let waypoints = offset_waypoints_to_right_lane(waypoints);
                             let mut h = physics.http.lock().unwrap();
                             h.waypoints = waypoints;

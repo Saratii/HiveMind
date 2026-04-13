@@ -104,7 +104,6 @@ struct PortalMaterials {
 pub struct CarAssets {
     pub scene: Handle<Scene>,
     pub ambulance_scene: Handle<Scene>,
-    pub ambulance_scene: Handle<Scene>,
     pub skybox: Handle<Image>,
 }
 

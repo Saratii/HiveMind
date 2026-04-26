@@ -17,6 +17,7 @@ pub mod buildings;
 pub mod cameras;
 pub mod car_emulator;
 pub mod map_parser;
+pub mod pedestrian;
 
 use bevy::{
     core_pipeline::Skybox,
@@ -43,6 +44,7 @@ use crate::{
         car_spawn_queue_system, parking_in_system, pre_road_system, update_car_physics,
     },
     map_parser::{CityData, PortalMarker, Waypoint, parse_city},
+    pedestrian::{pedestrian_move_system, pedestrian_spawn_system, setup_pedestrian_timers},
 };
 
 const CITY_JSON_PATH: &str = "../city.json";
@@ -55,6 +57,7 @@ const BATCH_SPAWN_COUNT: usize = 20;
 const CAR_SCALE: f32 = 3.5;
 const AMBULANCE_SCALE: f32 = 3.0;
 const ROAD_WIDTH: f32 = 24.0;
+const CAR_PATH_SEGMENT_THICKNESS: f32 = 1.0;
 
 // Marker component attached to the UI button that shows and hides all building meshes
 #[derive(Component)]
@@ -150,7 +153,7 @@ impl Default for DayNightCycle {
     fn default() -> Self {
         Self {
             angle: 0.0,
-            cycle_speed: PI / 120.0,
+            cycle_speed: PI / 20.0,
         }
     }
 }
@@ -485,7 +488,7 @@ fn main() {
         .insert_resource(DayNightCycle::default())
         .insert_resource(DayNightCycle::default())
         .insert_non_send_resource(city)
-        .add_systems(Startup, (setup, spawn_buildings))
+        .add_systems(Startup, (setup, spawn_buildings, setup_pedestrian_timers))
         .add_systems(
             Update,
             (
@@ -498,6 +501,8 @@ fn main() {
                 pre_road_system,
                 update_car_physics,
                 toggle_buildings_system,
+                pedestrian_spawn_system,
+                pedestrian_move_system,
             ),
         )
         .add_systems(
@@ -1185,8 +1190,6 @@ fn spawn_path_segments(
         if waypoints.is_empty() {
             continue;
         }
-        let seg_height = 2.0;
-        let seg_thickness = 5.0;
         let y_offset = 11.0;
         let lc = car_color.0.to_linear();
         let path_mat = materials.add(StandardMaterial {
@@ -1206,7 +1209,11 @@ fn spawn_path_segments(
             let mid = Vec2::new((a.x + b.x) * 0.5, (a.z + b.z) * 0.5);
             let angle = diff.y.atan2(diff.x);
             commands.spawn((
-                Mesh3d(meshes.add(Cuboid::new(len, seg_height, seg_thickness))),
+                Mesh3d(meshes.add(Cuboid::new(
+                    len,
+                    CAR_PATH_SEGMENT_THICKNESS,
+                    CAR_PATH_SEGMENT_THICKNESS,
+                ))),
                 MeshMaterial3d(path_mat.clone()),
                 Transform::from_xyz(mid.x, y_offset, mid.y)
                     .with_rotation(Quat::from_rotation_y(-angle)),

@@ -4,8 +4,8 @@ Name of program: buildings.rs
 Description: Procedural seeded building generation placed along road edges without intersecting road corridors.
 Author: Maren Proplesch
 Date Created: 3/31/2026
-Date Revised: 3/31/2026
-Revision History: Fixed placement logic. Promoted all magic numbers to named constants.
+Date Revised: 4/26/2026
+Revision History: Fixed placement logic. Promoted all magic numbers to named constants. Added emissive window strips to all building archetypes.
 Preconditions: Not applicable/Redundant
 Postconditions: Not applicable/Redundant
 Citation: Used AI copilot for limited code generation - claude.ai
@@ -103,6 +103,12 @@ const STEPPED_SPIRE_H_MIN: f32 = 10.0;
 const STEPPED_SPIRE_H_MAX: f32 = 24.0;
 const STEPPED_SPIRE_R_FRACTION: f32 = 0.22;
 const STEPPED_SPIRE_R_MIN: f32 = 1.5;
+
+// window lighting
+const WIN_THICKNESS: f32 = 0.5;
+const WIN_H_FRACTION: f32 = 0.72; // window strip height relative to floor height
+const WIN_W_FRACTION: f32 = 0.78; // window strip width relative to face width
+const WIN_FLOOR_H: f32 = 22.0; // approximate floor-to-floor height for slot count
 
 // Marker component attached to every building mesh entity so the toggle system can query them
 #[derive(Component)]
@@ -203,6 +209,60 @@ fn building_color(rng: &mut u64) -> (Color, LinearRgba) {
         1.0,
     );
     (Color::srgb(r, g, b), emissive)
+}
+
+// Spawns a column of emissive window quads on one face of a building; each floor slot gets its
+// own thin unlit cuboid placed just proud of the face surface, with ~25% of floors randomly dark
+// to simulate unoccupied rooms; unlit: true means these glow at full emissive strength regardless
+// of the day-night ambient level, making them pop at night without any point lights or shadows
+// Input: commands, meshes, materials: Bevy asset params; cx, cy_base, cz: world XZ center and
+//   Y bottom of the building body; win_w, win_d: f32 quad dimensions along and across the face;
+//   body_h: f32 total body height used to compute floor count; ox, oz: f32 offset from building
+//   center to place the quad on the face surface; is_cool: bool warm-yellow vs cool-blue tint;
+//   rng: &mut u64 LCG state
+// Returns: none
+fn spawn_window_strips(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    cx: f32,
+    cy_base: f32,
+    cz: f32,
+    win_w: f32,
+    win_d: f32,
+    body_h: f32,
+    ox: f32,
+    oz: f32,
+    is_cool: bool,
+    rng: &mut u64,
+) {
+    let floors = ((body_h / WIN_FLOOR_H) as usize).max(1).min(24);
+    let floor_h = body_h / floors as f32;
+    let win_h = floor_h * WIN_H_FRACTION;
+    let (base, er, eg, eb) = if is_cool {
+        (Color::srgb(0.75, 0.90, 1.00), 15.0_f32, 22.0_f32, 30.0_f32)
+    } else {
+        (Color::srgb(1.00, 0.95, 0.75), 30.0_f32, 22.0_f32, 8.0_f32)
+    };
+    for floor in 0..floors {
+        if lcg(rng) % 4 == 0 {
+            continue;
+        }
+        let y = cy_base + floor_h * (floor as f32 + 0.5);
+        let win_mat = materials.add(StandardMaterial {
+            base_color: base,
+            emissive: LinearRgba::new(er, eg, eb, 1.0),
+            unlit: true,
+            ..default()
+        });
+        commands.spawn((
+            Mesh3d(meshes.add(Cuboid::new(win_w, win_h, win_d))),
+            MeshMaterial3d(win_mat),
+            Transform::from_xyz(cx + ox, y, cz + oz),
+            Pickable::IGNORE,
+            BuildingMarker,
+        ));
+    }
 }
 
 // Spawns one procedural building made of Cuboid and Cylinder primitives at world position (cx, cz);
@@ -319,6 +379,54 @@ fn spawn_building(
                 Pickable::IGNORE,
                 BuildingMarker,
             ));
+            // window lighting: three faces, towers lean cool (offices/glass)
+            let is_cool = lcg(rng) % 3 == 0;
+            let body_base_y = plinth_h;
+            spawn_window_strips(
+                commands,
+                meshes,
+                materials,
+                cx,
+                body_base_y,
+                cz,
+                w * WIN_W_FRACTION,
+                WIN_THICKNESS,
+                h,
+                0.0,
+                d * 0.5 + 0.3,
+                is_cool,
+                rng,
+            );
+            spawn_window_strips(
+                commands,
+                meshes,
+                materials,
+                cx,
+                body_base_y,
+                cz,
+                w * WIN_W_FRACTION,
+                WIN_THICKNESS,
+                h,
+                0.0,
+                -(d * 0.5 + 0.3),
+                is_cool,
+                rng,
+            );
+            spawn_window_strips(
+                commands,
+                meshes,
+                materials,
+                cx,
+                body_base_y,
+                cz,
+                WIN_THICKNESS,
+                d * WIN_W_FRACTION,
+                h,
+                w * 0.5 + 0.3,
+                0.0,
+                is_cool,
+                rng,
+            );
         }
         // wide commercial block: squat body with decorative parapet ridges along all four edges
         1 => {
@@ -387,6 +495,69 @@ fn spawn_building(
                 Pickable::IGNORE,
                 BuildingMarker,
             ));
+            // window lighting: all four faces, commercial blocks lean warm (shops/offices)
+            let is_cool = lcg(rng) % 4 == 0;
+            let body_base_y = plinth_h;
+            spawn_window_strips(
+                commands,
+                meshes,
+                materials,
+                cx,
+                body_base_y,
+                cz,
+                w * WIN_W_FRACTION,
+                WIN_THICKNESS,
+                h,
+                0.0,
+                d * 0.5 + 0.3,
+                is_cool,
+                rng,
+            );
+            spawn_window_strips(
+                commands,
+                meshes,
+                materials,
+                cx,
+                body_base_y,
+                cz,
+                w * WIN_W_FRACTION,
+                WIN_THICKNESS,
+                h,
+                0.0,
+                -(d * 0.5 + 0.3),
+                is_cool,
+                rng,
+            );
+            spawn_window_strips(
+                commands,
+                meshes,
+                materials,
+                cx,
+                body_base_y,
+                cz,
+                WIN_THICKNESS,
+                d * WIN_W_FRACTION,
+                h,
+                w * 0.5 + 0.3,
+                0.0,
+                is_cool,
+                rng,
+            );
+            spawn_window_strips(
+                commands,
+                meshes,
+                materials,
+                cx,
+                body_base_y,
+                cz,
+                WIN_THICKNESS,
+                d * WIN_W_FRACTION,
+                h,
+                -(w * 0.5 + 0.3),
+                0.0,
+                is_cool,
+                rng,
+            );
         }
         // setback stepped tower: 2-4 shrinking tiers with accent ledges and a cylinder spire on top
         _ => {
@@ -417,6 +588,53 @@ fn spawn_building(
                     Pickable::IGNORE,
                     BuildingMarker,
                 ));
+                // window lighting: two faces per tier, mix of warm and cool per tier
+                let is_cool = lcg(rng) % 3 == 0;
+                spawn_window_strips(
+                    commands,
+                    meshes,
+                    materials,
+                    cx,
+                    cur_y,
+                    cz,
+                    cur_w * WIN_W_FRACTION,
+                    WIN_THICKNESS,
+                    tier_h,
+                    0.0,
+                    cur_d * 0.5 + 0.3,
+                    is_cool,
+                    rng,
+                );
+                spawn_window_strips(
+                    commands,
+                    meshes,
+                    materials,
+                    cx,
+                    cur_y,
+                    cz,
+                    cur_w * WIN_W_FRACTION,
+                    WIN_THICKNESS,
+                    tier_h,
+                    0.0,
+                    -(cur_d * 0.5 + 0.3),
+                    is_cool,
+                    rng,
+                );
+                spawn_window_strips(
+                    commands,
+                    meshes,
+                    materials,
+                    cx,
+                    cur_y,
+                    cz,
+                    WIN_THICKNESS,
+                    cur_d * WIN_W_FRACTION,
+                    tier_h,
+                    cur_w * 0.5 + 0.3,
+                    0.0,
+                    is_cool,
+                    rng,
+                );
                 if tier < tiers - 1 {
                     commands.spawn((
                         Mesh3d(meshes.add(Cuboid::new(
